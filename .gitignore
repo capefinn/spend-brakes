@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+node_modules/
+dist/
+package-lock.json
+spend-ledger*.jsonl
+*.lock
