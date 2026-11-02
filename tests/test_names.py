@@ -13,6 +13,21 @@ from helpers import Script
 FI_NFC = unicodedata.normalize("NFC", "Kuvat äänet")
 FI_NFD = unicodedata.normalize("NFD", "Kuvat äänet")
 
+# Names that differ only by a mark (a vowel sign or a tone mark). The marks are written as code points on purpose.
+HI_KIM = "\u0915\u093f\u092e"  # Hindi: ka + vowel sign i (Mc) + ma
+HI_KUM = "\u0915\u0941\u092e"  # Hindi: ka + vowel sign u (Mn) + ma
+HI_KM = "\u0915\u092e"  # Hindi: ka + ma, no vowel sign
+TH_KIN = "\u0e01\u0e34\u0e19"  # Thai: ko kai + vowel mark i + no nu
+TH_KUN = "\u0e01\u0e38\u0e19"  # Thai: ko kai + vowel mark u + no nu
+TH_KN = "\u0e01\u0e19"  # Thai: no vowel mark
+TH_SHOP = "\u0e23\u0e49\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"  # Thai: the second letter carries a tone mark
+TH_SHOP_PLAIN = "\u0e23\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"  # the same word without the tone mark
+TH_SHOP_OTHER = "\u0e23\u0e48\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"  # the same word with another tone mark
+AR_KITAB_I = "\u0643\u0650\u062a\u0627\u0628"  # Arabic: kaf + kasra + ta alef ba
+AR_KITAB_U = "\u0643\u064f\u062a\u0627\u0628"  # Arabic: kaf + damma + ta alef ba
+AR_KITAB = "\u0643\u062a\u0627\u0628"  # Arabic: no vowel marks
+WITH_MARKS = [(HI_KIM, HI_KUM, HI_KM), (TH_KIN, TH_KUN, TH_KN), (TH_SHOP, TH_SHOP_PLAIN, TH_SHOP_OTHER), (AR_KITAB_I, AR_KITAB_U, AR_KITAB)]
+
 # The same table is in typescript/spend-brakes.test.ts. Keep the two tables equal.
 KEYS = [
     ("blog-images", "BLOG_IMAGES"), ("Blog_Images", "BLOG_IMAGES"), ("BLOG IMAGES", "BLOG_IMAGES"),
@@ -23,10 +38,15 @@ KEYS = [
     ("مدونة", "مدونة"),
     ("Блог", "БЛОГ"), ("Москва-2026", "МОСКВА_2026"), ("Киев-2026", "КИЕВ_2026"),
     ("Straße", "STRASSE"), ("ＢＬＯＧ　ｉｍａｇｅｓ", "BLOG_IMAGES"), ("ΐ", "Ϊ́"),
+    (HI_KIM, HI_KIM), (HI_KUM, HI_KUM), (HI_KM, HI_KM), (HI_KIM + " " + HI_KUM, HI_KIM + "_" + HI_KUM),
+    (TH_KIN, TH_KIN), (TH_KUN, TH_KUN), (TH_KN, TH_KN), (TH_SHOP, TH_SHOP), (TH_SHOP_PLAIN, TH_SHOP_PLAIN),
+    (AR_KITAB_I, AR_KITAB_I), (AR_KITAB_U, AR_KITAB_U), (AR_KITAB, AR_KITAB),
+    ("e\u0301cole", "\u00c9COLE"),  # a letter plus an accent mark: joined by NFKC, and the accent stays in the key
     ("!!!", ""), ("---", ""), ("   ", ""), ("🚀", ""), ("🚀🚀", ""), ("", ""),
+    ("\u093f", ""), ("\u0e49", ""), ("!\u0301!", ""), (" \u0650 ", ""), ("-\u093f-\u0e49-", ""),  # only marks and punctuation
 ]
-EMPTY_KEY = ["!!!", "---", "   ", "...", "🚀", "🚀 🚀", "—", "_"]
-NAMES_FROM_OTHER_SCRIPTS = [FI_NFC, FI_NFD, "ブログ", "画像 v2", "مدونة", "Блог", "Москва-2026"]
+EMPTY_KEY = ["!!!", "---", "   ", "...", "🚀", "🚀 🚀", "—", "_", "\u093f", "\u0e49", "\u0650", "!\u0301!", "- \u093f -"]
+NAMES_FROM_OTHER_SCRIPTS = [FI_NFC, FI_NFD, "ブログ", "画像 v2", "مدونة", "Блог", "Москва-2026", HI_KIM, TH_KUN, AR_KITAB_I]
 
 
 @pytest.mark.parametrize("name,key", KEYS)
@@ -39,6 +59,22 @@ def test_finnish_in_both_forms_is_one_key_and_different_names_are_different_keys
     assert project_key("Äänet") != project_key("net")
     assert project_key("ブログ v2") != project_key("画像 v2")
     assert project_key("Москва-2026") != project_key("Киев-2026")
+
+
+@pytest.mark.parametrize("names", WITH_MARKS)
+def test_names_that_differ_only_by_a_mark_have_different_keys_and_the_mark_stays_in_the_key(names):
+    keys = [project_key(name) for name in names]
+    assert len(set(keys)) == len(names) and all(keys)
+    for name, key in zip(names, keys):
+        assert key == name  # these scripts have no capital letters, and every mark stays where it was
+        assert "_" not in key  # a mark never splits a word
+
+
+def test_a_mark_is_kept_in_a_word_but_a_name_of_marks_and_punctuation_has_no_key():
+    assert project_key("e\u0301cole") == project_key("\u00e9cole") == "\u00c9COLE"  # the same accent, written two ways
+    assert project_key("cafe\u0301") != project_key("cafe")
+    assert project_key("\u093f") == project_key("!\u0301!") == project_key("\u0e49 \u0650") == ""
+    assert project_key("\u093f x") == "\u093f_X"  # a mark next to a letter or digit in the name is kept; the word "x" gives the key a letter
 
 
 # ---- a name in another script works in the default setup --------------------------------------------------------
@@ -104,7 +140,8 @@ def test_both_forms_share_the_job_count(call):
             call(fn, project=name, job="run-1", caps=caps)
 
 
-@pytest.mark.parametrize("first,second", [("Äänet", "net"), ("ブログ v2", "画像 v2"), ("Москва-2026", "Киев-2026"), ("ブログ", "画像")])
+@pytest.mark.parametrize("first,second", [("Äänet", "net"), ("ブログ v2", "画像 v2"), ("Москва-2026", "Киев-2026"), ("ブログ", "画像"),
+                                          (HI_KIM, HI_KUM), (HI_KIM, HI_KM), (TH_KIN, TH_KUN), (TH_SHOP, TH_SHOP_PLAIN), (TH_SHOP, TH_SHOP_OTHER), (AR_KITAB_I, AR_KITAB_U), (AR_KITAB_I, AR_KITAB)])
 def test_different_names_do_not_share_a_cap(call, first, second):
     caps, fn = Caps(monthly_usd=100.0, project_usd=0.25, max_calls_per_job=20), Script("ok")
     for name in (first, second):

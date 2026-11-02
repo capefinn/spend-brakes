@@ -32,15 +32,17 @@ const MAX_NAME_LENGTH = 200; // keeps every ledger row short
 /** The key of a project or provider name. It is the name inside the setting names, and it is what totals count by.
  *  Steps: Unicode NFKC normalisation, then case-folding (toLowerCase, and NFKC once more, so that Python and TypeScript
  *  give the same key when case-folding splits a letter into a letter and a mark), then every run of characters that are
- *  not Unicode letters or digits becomes one "_", the "_" at the start and the end is removed, and the result is written
- *  in capital letters. So "blog-images", "Blog_Images" and "BLOG IMAGES" all give "BLOG_IMAGES", and "Kuvat äänet" gives
- *  "KUVAT_ÄÄNET" whether the ä is one character or a letter plus a mark. The Python function project_key gives the same
- *  result. It gives "" for a name with no letter and no digit (only punctuation, spaces or emoji); guardedCall and
- *  checkCall refuse such a name with a bad_setting error.
+ *  not Unicode letters, digits or marks becomes one "_", the "_" at the start and the end is removed, and the result is
+ *  written in capital letters. A mark (a vowel sign in Hindi or Thai, a vowel mark in Arabic, an accent) is part of the
+ *  word, so two names that differ only by a mark have two keys. So "blog-images", "Blog_Images" and "BLOG IMAGES" all
+ *  give "BLOG_IMAGES", and "Kuvat äänet" gives "KUVAT_ÄÄNET" whether the ä is one character or a letter plus a mark.
+ *  The Python function project_key gives the same result. It gives "" for a name with no letter and no digit (only
+ *  punctuation, spaces, emoji or marks); guardedCall and checkCall refuse such a name with a bad_setting error.
  *  A Ledger you write yourself must count the project total and the job count by this key. */
 export const projectKey = (name: string): string => {
   if (typeof name !== "string") throw new BrakeError("bad_setting", "A project or provider name must be plain text (a string).");
-  return name.normalize("NFKC").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  const key = name.normalize("NFKC").toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}\p{M}]+/gu, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  return /[\p{L}\p{N}]/u.test(key) ? key : "";
 };
 const envWord = (name: string, label = "name") => {
   const w = projectKey(name);

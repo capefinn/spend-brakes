@@ -564,6 +564,21 @@ test("a row written under one spelling (for example by the Python package) count
 });
 
 const FI_NFC = "Kuvat äänet".normalize("NFC"), FI_NFD = "Kuvat äänet".normalize("NFD");
+// Names that differ only by a mark (a vowel sign or a tone mark). The marks are written as code points on purpose.
+const HI_KIM = "\u0915\u093f\u092e"; // Hindi: ka + vowel sign i (Mc) + ma
+const HI_KUM = "\u0915\u0941\u092e"; // Hindi: ka + vowel sign u (Mn) + ma
+const HI_KM = "\u0915\u092e"; // Hindi: ka + ma, no vowel sign
+const TH_KIN = "\u0e01\u0e34\u0e19"; // Thai: ko kai + vowel mark i + no nu
+const TH_KUN = "\u0e01\u0e38\u0e19"; // Thai: ko kai + vowel mark u + no nu
+const TH_KN = "\u0e01\u0e19"; // Thai: no vowel mark
+const TH_SHOP = "\u0e23\u0e49\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"; // Thai: the second letter carries a tone mark
+const TH_SHOP_PLAIN = "\u0e23\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"; // the same word without the tone mark
+const TH_SHOP_OTHER = "\u0e23\u0e48\u0e32\u0e19\u0e01\u0e32\u0e41\u0e1f"; // the same word with another tone mark
+const AR_KITAB_I = "\u0643\u0650\u062a\u0627\u0628"; // Arabic: kaf + kasra + ta alef ba
+const AR_KITAB_U = "\u0643\u064f\u062a\u0627\u0628"; // Arabic: kaf + damma + ta alef ba
+const AR_KITAB = "\u0643\u062a\u0627\u0628"; // Arabic: no vowel marks
+const WITH_MARKS = [[HI_KIM, HI_KUM, HI_KM], [TH_KIN, TH_KUN, TH_KN], [TH_SHOP, TH_SHOP_PLAIN, TH_SHOP_OTHER], [AR_KITAB_I, AR_KITAB_U, AR_KITAB]];
+
 // The same table is in tests/test_names.py. Keep the two tables equal.
 const KEYS: [string, string][] = [
   ["blog-images", "BLOG_IMAGES"], ["Blog_Images", "BLOG_IMAGES"], ["BLOG IMAGES", "BLOG_IMAGES"],
@@ -574,10 +589,15 @@ const KEYS: [string, string][] = [
   ["مدونة", "مدونة"],
   ["Блог", "БЛОГ"], ["Москва-2026", "МОСКВА_2026"], ["Киев-2026", "КИЕВ_2026"],
   ["Straße", "STRASSE"], ["ＢＬＯＧ　ｉｍａｇｅｓ", "BLOG_IMAGES"], ["ΐ", "Ϊ́"],
+  [HI_KIM, HI_KIM], [HI_KUM, HI_KUM], [HI_KM, HI_KM], [HI_KIM + " " + HI_KUM, HI_KIM + "_" + HI_KUM],
+  [TH_KIN, TH_KIN], [TH_KUN, TH_KUN], [TH_KN, TH_KN], [TH_SHOP, TH_SHOP], [TH_SHOP_PLAIN, TH_SHOP_PLAIN],
+  [AR_KITAB_I, AR_KITAB_I], [AR_KITAB_U, AR_KITAB_U], [AR_KITAB, AR_KITAB],
+  ["e\u0301cole", "\u00c9COLE"], // a letter plus an accent mark: joined by NFKC, and the accent stays in the key
   ["!!!", ""], ["---", ""], ["   ", ""], ["🚀", ""], ["🚀🚀", ""], ["", ""],
+  ["\u093f", ""], ["\u0e49", ""], ["!\u0301!", ""], [" \u0650 ", ""], ["-\u093f-\u0e49-", ""], // only marks and punctuation
 ];
-const EMPTY_KEY = ["!!!", "---", "   ", "...", "🚀", "🚀 🚀", "—", "_"];
-const OTHER_SCRIPTS = [FI_NFC, FI_NFD, "ブログ", "画像 v2", "مدونة", "Блог", "Москва-2026"];
+const EMPTY_KEY = ["!!!", "---", "   ", "...", "🚀", "🚀 🚀", "—", "_", "\u093f", "\u0e49", "\u0650", "!\u0301!", "- \u093f -"];
+const OTHER_SCRIPTS = [FI_NFC, FI_NFD, "ブログ", "画像 v2", "مدونة", "Блог", "Москва-2026", HI_KIM, TH_KUN, AR_KITAB_I];
 
 test("projectKey: NFKC, case-fold, runs of non-letters and non-digits become _, capital letters; the same table as Python", () => {
   for (const [name, key] of KEYS) assert.equal(projectKey(name), key, JSON.stringify(name));
@@ -585,6 +605,21 @@ test("projectKey: NFKC, case-fold, runs of non-letters and non-digits become _, 
   assert.notEqual(projectKey("Äänet"), projectKey("net"));
   assert.notEqual(projectKey("ブログ v2"), projectKey("画像 v2"));
   assert.notEqual(projectKey("Москва-2026"), projectKey("Киев-2026"));
+});
+
+test("names that differ only by a mark have different keys, and the mark stays in the key", () => {
+  for (const names of WITH_MARKS) {
+    const keys = names.map(projectKey);
+    assert.equal(new Set(keys).size, names.length);
+    names.forEach((name, i) => { assert.equal(keys[i], name); assert.ok(!keys[i].includes("_")); }); // no capital letters in these scripts; a mark never splits a word
+  }
+  assert.equal(projectKey("e\u0301cole"), projectKey("\u00e9cole")); // the same accent, written two ways
+  assert.equal(projectKey("e\u0301cole"), "\u00c9COLE");
+  assert.notEqual(projectKey("cafe\u0301"), projectKey("cafe"));
+  assert.equal(projectKey("\u093f"), "");
+  assert.equal(projectKey("!\u0301!"), "");
+  assert.equal(projectKey("\u0e49 \u0650"), "");
+  assert.equal(projectKey("\u093f x"), "\u093f_X"); // a mark next to a letter or digit in the name is kept
 });
 
 test("a project name in another script works when no project cap is set, as caps from the environment and as an argument", async () => {
@@ -631,7 +666,8 @@ test("a file ledger counts both forms of a Finnish name together", async () => {
 });
 
 test("different names do not share a cap", async () => {
-  for (const [first, second] of [["Äänet", "net"], ["ブログ v2", "画像 v2"], ["Москва-2026", "Киев-2026"], ["ブログ", "画像"]]) {
+  for (const [first, second] of [["Äänet", "net"], ["ブログ v2", "画像 v2"], ["Москва-2026", "Киев-2026"], ["ブログ", "画像"],
+    [HI_KIM, HI_KUM], [HI_KIM, HI_KM], [TH_KIN, TH_KUN], [TH_SHOP, TH_SHOP_PLAIN], [TH_SHOP, TH_SHOP_OTHER], [AR_KITAB_I, AR_KITAB_U], [AR_KITAB_I, AR_KITAB]]) {
     const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.25, maxCallsPerJob: 20 }), fn = script("ok");
     for (const project of [first, second]) {
       await guardedCall(fn, { ...base, ledger, caps, project });

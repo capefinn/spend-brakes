@@ -29,24 +29,27 @@ def project_key(name: str) -> str:
 
     Steps: Unicode NFKC normalisation, then case-folding (and NFKC once more, because case-folding can split a letter
     into a letter and a mark, and Python and TypeScript must give the same key), then every run of characters that are
-    not Unicode letters or digits becomes one "_", the "_" at the start and the end is removed, and the result is
-    written in capital letters. So "blog-images", "Blog_Images" and "BLOG IMAGES" all give "BLOG_IMAGES", and
-    "Kuvat äänet" gives "KUVAT_ÄÄNET" whether the ä is one character or a letter plus a mark. The TypeScript function
-    projectKey gives the same result.
+    not Unicode letters, digits or marks becomes one "_", the "_" at the start and the end is removed, and the result
+    is written in capital letters. A mark (a vowel sign in Hindi or Thai, a vowel mark in Arabic, an accent) is part of
+    the word, so two names that differ only by a mark have two keys. So "blog-images", "Blog_Images" and "BLOG IMAGES"
+    all give "BLOG_IMAGES", and "Kuvat äänet" gives "KUVAT_ÄÄNET" whether the ä is one character or a letter plus a
+    mark. The TypeScript function projectKey gives the same result.
 
-    It does not raise for a str. It gives "" for a name with no letter and no digit (only punctuation, spaces or
-    emoji); guarded_call refuses such a name with ConfigError."""
-    words, current = [], []
+    It does not raise for a str. It gives "" for a name with no letter and no digit (only punctuation, spaces, emoji
+    or marks); guarded_call refuses such a name with ConfigError."""
+    words, current, has_letter_or_digit = [], [], False
     folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
     for char in folded:
-        if char.isalnum():
+        kind = unicodedata.category(char)[0]  # L letter, N number, M mark
+        if kind in "LNM":
             current.append(char)
+            has_letter_or_digit = has_letter_or_digit or kind != "M"
         elif current:
             words.append("".join(current))
             current = []
     if current:
         words.append("".join(current))
-    return "_".join(words).upper()
+    return "_".join(words).upper() if has_letter_or_digit else ""
 
 
 def env_word(name: str, label: str = "name") -> str:
