@@ -4,17 +4,20 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import urllib.error
+
 import pytest
 
+import spend_brakes.httpjson as httpjson_module
 from spend_brakes import Caps, ConfigError, NotRetried, RetriesExhausted, guarded_call
-from spend_brakes.httpjson import HttpStatusError, post_json
+from spend_brakes.httpjson import HttpStatusError, check_url, post_json
 
 KEY = "test-key-abc123"
 ENV = {"TEST_API_KEY": KEY}
 
 
-@pytest.fixture
-def server():
+def start_server():
+    """A fake API on the loopback address. Plan entries: (status, body) or (status, body, extra_headers)."""
     state = {"plan": [], "hits": 0, "seen": []}
 
     class Handler(BaseHTTPRequestHandler):
@@ -23,15 +26,19 @@ def server():
             state["seen"].append({"path": self.path, "auth": self.headers.get("Authorization")})
             self.rfile.read(int(self.headers.get("Content-Length") or 0))
             plan = state["plan"]
-            status, body = plan[min(state["hits"], len(plan)) - 1] if plan else (200, {"ok": True})
+            status, body, *more = plan[min(state["hits"], len(plan)) - 1] if plan else (200, {"ok": True})
             if body == "slow":
                 time.sleep(0.6)
                 body = {}
             raw = json.dumps(body).encode()
             self.send_response(status)
+            for name, value in (more[0] if more else {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        do_GET = do_POST
 
         def log_message(self, *args):
             pass
@@ -40,6 +47,21 @@ def server():
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     state["url"] = f"http://127.0.0.1:{httpd.server_address[1]}/call"
+    return state, httpd
+
+
+@pytest.fixture
+def server():
+    state, httpd = start_server()
+    yield state
+    httpd.shutdown()
+    httpd.server_close()
+
+
+@pytest.fixture
+def other_server():
+    """A second address: where a redirect would send the key."""
+    state, httpd = start_server()
     yield state
     httpd.shutdown()
     httpd.server_close()
@@ -109,3 +131,74 @@ def test_a_missing_key_stops_before_any_request(server, ledger):
 def test_http_status_error_carries_the_status():
     err = HttpStatusError(402, "body")
     assert err.status == 402 and "402" in str(err)
+
+
+# ---- a redirect must never carry the key to another address ----------------------------------------------------
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_is_not_followed_and_the_key_never_reaches_the_second_address(server, other_server, status):
+    server["plan"] = [(status, {}, {"Location": other_server["url"]})]
+    with pytest.raises(HttpStatusError) as stop:
+        post_json(server["url"], {"prompt": "x"}, key_env="TEST_API_KEY", env=ENV)
+    assert stop.value.status == status and "redirect not followed" in str(stop.value)
+    assert server["hits"] == 1
+    assert other_server["hits"] == 0 and other_server["seen"] == []  # nothing, and so no Authorization header, arrived
+
+
+def test_a_redirect_through_the_guard_is_one_call_and_an_error_not_a_retry(server, other_server, run):
+    server["plan"] = [(302, {}, {"Location": other_server["url"]})]
+    with pytest.raises(HttpStatusError):
+        run(server["url"], max_retries=3)
+    assert server["hits"] == 1 and other_server["hits"] == 0
+
+
+def test_a_redirect_without_a_location_is_also_an_error(server):
+    server["plan"] = [(302, {})]
+    with pytest.raises(HttpStatusError) as stop:
+        post_json(server["url"], {}, key_env="TEST_API_KEY", env=ENV)
+    assert stop.value.status == 302
+
+
+# ---- only https, or http for the local machine -----------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "file:///etc/hosts", "FILE:///etc/hosts", "ftp://api.invalid/x", "data:text/plain,hello", "javascript:alert(1)",
+    "gopher://api.invalid/x", "ws://api.invalid/x", "//api.invalid/x", "api.invalid/x", "", "   ",
+    "http://api.invalid/x",  # plain http to another machine: the key could be read on the way
+    "HTTP://api.invalid/x",
+    "http://localhost.api.invalid/x",  # looks like localhost, is not
+    "http://127.0.0.1.api.invalid/x",
+    "http://[::1]@api.invalid/x",
+    "https://user:secret@api.invalid/x",  # user name and password in the URL
+    "https://@api.invalid/x",
+    "https:///no-host",
+    "https://api.invalid/a b", "https://api.invalid/\nHost: other",
+    "http://[::1/x",
+])
+def test_unsafe_addresses_are_refused_before_any_request_is_made(url, monkeypatch):
+    def no_request(*args, **kwargs):
+        raise AssertionError("a request was about to be made")
+
+    monkeypatch.setattr(httpjson_module, "_opener", no_request)
+    with pytest.raises(ConfigError) as stop:
+        post_json(url, {}, key_env="TEST_API_KEY", env=ENV)  # the key IS set: the URL itself is what is refused
+    assert "TEST_API_KEY" not in str(stop.value)
+
+
+def test_file_urls_are_refused_and_the_file_is_never_opened(tmp_path, monkeypatch):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not read me")
+    with pytest.raises(ConfigError):
+        post_json(secret.as_uri(), {}, key_env="TEST_API_KEY", env=ENV)
+    # and even if a file URL got through the check, this client has no handler that can open files
+    monkeypatch.setattr(httpjson_module, "check_url", lambda url: url)
+    with pytest.raises(urllib.error.URLError):
+        post_json(secret.as_uri(), {}, key_env="TEST_API_KEY", env=ENV)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.invalid/v1/x", "HTTPS://api.invalid/v1/x", "https://api.invalid:8443/x?y=1",
+    "http://localhost:8080/x", "http://127.0.0.1:1/x", "http://127.0.0.2/x", "http://[::1]:8080/x",
+])
+def test_https_and_local_http_addresses_are_accepted(url):
+    assert check_url(url) == url

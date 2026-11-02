@@ -14,7 +14,7 @@ def test_master_switch_stops_every_provider(value):
         with pytest.raises(KillSwitchOn) as stop:
             check_kill_switch(provider, {"SPEND_PANIC": value})
         assert stop.value.brake == "kill_switch"
-        assert "SPEND_PANIC" in str(stop.value) and "unset" in str(stop.value)  # says how to undo it
+        assert "SPEND_PANIC" in str(stop.value) and "owner" in str(stop.value)  # names the setting, leaves the choice to the owner
 
 
 @pytest.mark.parametrize("value", ["0", "false", "off", "no", ""])
@@ -49,7 +49,7 @@ def test_stop_file_stops_calls_while_it_exists(tmp_path):
     stop_file.write_text("")
     with pytest.raises(KillSwitchOn) as stop:
         check_kill_switch("image_api", env)
-    assert "delete that file" in str(stop.value)
+    assert "owner removes that file" in str(stop.value)
     stop_file.unlink()
     check_kill_switch("image_api", env)
 

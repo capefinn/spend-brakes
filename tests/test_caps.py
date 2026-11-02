@@ -22,6 +22,10 @@ def test_caps_are_read_from_the_environment():
     ("SPEND_MONTHLY_CAP_USD", "abc"), ("SPEND_MONTHLY_CAP_USD", "nan"), ("SPEND_MONTHLY_CAP_USD", "inf"),
     ("SPEND_MONTHLY_CAP_USD", "-1"), ("SPEND_PROJECT_CAP_USD_P", "x"), ("SPEND_MAX_CALLS_PER_JOB", "2.5"),
     ("SPEND_MAX_CALLS_PER_JOB", "0"), ("SPEND_MAX_CALLS_PER_JOB", "-3"),
+    # not a finite number: must be a ConfigError, never a crash from int() and never a silent default
+    ("SPEND_MAX_CALLS_PER_JOB", "nan"), ("SPEND_MAX_CALLS_PER_JOB", "NaN"), ("SPEND_MAX_CALLS_PER_JOB", "inf"),
+    ("SPEND_MAX_CALLS_PER_JOB", "-inf"), ("SPEND_MAX_CALLS_PER_JOB", "1e400"), ("SPEND_MAX_CALLS_PER_JOB", "Infinity"),
+    ("SPEND_MONTHLY_CAP_USD", "1e400"), ("SPEND_PROJECT_CAP_USD_P", "inf"), ("SPEND_PROJECT_CAP_USD_P", "nan"),
 ])
 def test_unreadable_settings_are_refused_not_ignored(name, value):
     with pytest.raises(ConfigError):
@@ -55,3 +59,15 @@ def test_caps_cannot_be_changed_after_they_are_made():
 def test_a_project_name_without_letters_is_refused():
     with pytest.raises(ConfigError):
         Caps.from_env("---", {})
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e400"])
+def test_a_non_finite_job_limit_is_a_config_error_not_another_error_type(value):
+    with pytest.raises(ConfigError) as stop:
+        Caps.from_env("p", {"SPEND_MAX_CALLS_PER_JOB": value})
+    assert type(stop.value) is ConfigError  # not ValueError, OverflowError or HardCeilingExceeded
+
+
+def test_a_huge_but_finite_job_limit_is_stopped_by_the_ceiling():
+    with pytest.raises(HardCeilingExceeded):
+        Caps.from_env("p", {"SPEND_MAX_CALLS_PER_JOB": "1e300"})

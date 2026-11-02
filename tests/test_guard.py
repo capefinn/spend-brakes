@@ -1,10 +1,11 @@
+import re
 import socket
 import urllib.error
 
 import pytest
 
-from spend_brakes import (Caps, ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached, NotRetried,
-                          ProjectCapReached, RetriesExhausted)
+from spend_brakes import (BrakeError, Caps, ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached,
+                          NotRetried, ProjectCapReached, RetriesExhausted, guarded_call, run_id)
 from spend_brakes.httpjson import HttpStatusError
 from helpers import FakeHttpError, Script
 
@@ -44,7 +45,7 @@ def test_a_bad_estimate_stops_before_anything_is_written(call, ledger, bad):
 
 # ---- the money caps --------------------------------------------------------------------------------------------
 
-def test_monthly_cap_stops_the_call_that_would_pass_it(call, ledger):
+def test_monthly_cap_stops_the_call_that_would_exceed_it(call, ledger):
     caps = Caps(monthly_usd=0.25)
     fn = Script("ok")
     call(fn, caps=caps)
@@ -53,11 +54,11 @@ def test_monthly_cap_stops_the_call_that_would_pass_it(call, ledger):
         call(fn, caps=caps)
     assert fn.calls == 2  # the third call never ran
     assert stop.value.brake == "monthly_cap"
-    assert "SPEND_MONTHLY_CAP_USD" in str(stop.value) and "on purpose" in str(stop.value)
+    assert "SPEND_MONTHLY_CAP_USD" in str(stop.value) and "Ask the owner to raise it" in str(stop.value)
     assert ledger.month_total() == 0.20
 
 
-def test_a_call_that_lands_exactly_on_the_cap_is_allowed_the_next_is_not(call):
+def test_a_call_that_reaches_exactly_the_cap_is_allowed_the_next_is_not(call):
     caps, fn = Caps(monthly_usd=0.30), Script("ok")
     for _ in range(3):
         call(fn, caps=caps)
@@ -80,6 +81,7 @@ def test_project_cap_stops_one_project_and_leaves_the_others(call):
     with pytest.raises(ProjectCapReached) as stop:
         call(Script("ok"), caps=caps, project="blog-images")
     assert stop.value.brake == "project_cap" and "SPEND_PROJECT_CAP_USD_BLOG_IMAGES" in str(stop.value)
+    assert "Ask the owner to raise it" in str(stop.value)
     call(Script("ok"), caps=Caps(monthly_usd=100.0), project="other")  # another project is not blocked
 
 
@@ -92,6 +94,7 @@ def test_job_limit_stops_a_loop_and_another_job_is_unaffected(call):
     with pytest.raises(JobLimitReached) as stop:
         call(fn, caps=caps, job="loop")
     assert fn.calls == 3 and stop.value.brake == "job_limit" and "SPEND_MAX_CALLS_PER_JOB" in str(stop.value)
+    assert "owner" in str(stop.value)
     call(fn, caps=caps, job="another")
 
 
@@ -125,7 +128,7 @@ def test_refusals_are_not_retried(call, ledger, sleeps, status):
     assert fn.calls == 1 and sleeps == []
     assert stop.value.brake == "no_retry" and stop.value.status == status
     assert isinstance(stop.value.__cause__, HttpStatusError)  # the original error is kept
-    assert str(status) in str(stop.value) and "on purpose" in str(stop.value)
+    assert str(status) in str(stop.value) and "owner" in str(stop.value)
     assert ledger.month_total() == 0  # refused before any work: nothing billed
     assert [r["outcome"] for r in ledger.rows() if r["event"] == "settle"] == ["rejected"]
 
@@ -227,3 +230,59 @@ def test_ctrl_c_is_not_swallowed(call, ledger):
     with pytest.raises(KeyboardInterrupt):
         call(Script(KeyboardInterrupt()))
     assert ledger.month_total() == 0.10  # the estimate was on record before the call
+
+
+# ---- the job name: required, and new for every run -------------------------------------------------------------
+
+def test_a_job_name_is_required_there_is_no_default():
+    fn = Script("ok")
+    with pytest.raises(TypeError, match="job"):
+        guarded_call(fn, estimate_usd=0.1, project="p", provider="x", caps=Caps(), env={})  # type: ignore[call-arg]
+    assert fn.calls == 0
+
+
+@pytest.mark.parametrize("bad", ["", None, "x" * 201])
+def test_an_empty_or_huge_job_name_is_refused(call, bad):
+    fn = Script("ok")
+    with pytest.raises(ConfigError):
+        call(fn, job=bad)
+    assert fn.calls == 0
+
+
+def test_a_new_run_gets_a_fresh_job_count_and_a_reused_name_keeps_the_old_count(call):
+    caps, fn = Caps(monthly_usd=100.0, max_calls_per_job=2), Script("ok")
+    for _ in range(2):
+        call(fn, caps=caps, job="batch-" + run_id())  # every run has its own name, so no run is ever blocked by an old one
+    first = "batch-" + run_id()
+    call(fn, caps=caps, job=first)
+    call(fn, caps=caps, job=first)
+    with pytest.raises(JobLimitReached):
+        call(fn, caps=caps, job=first)  # the same name again: its old calls still count
+
+
+def test_run_ids_are_different_every_time_and_safe_inside_a_job_name():
+    ids = {run_id() for _ in range(50)}
+    assert len(ids) == 50
+    assert all(re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{6}", i) for i in ids)
+
+
+# ---- stop messages name the setting and do not teach how to lift the stop --------------------------------------
+
+def test_money_cap_messages_say_ask_the_owner_and_give_no_how_to(call):
+    with pytest.raises(MonthlyCapReached) as monthly:
+        call(Script("ok"), caps=Caps(monthly_usd=0.05))
+    with pytest.raises(ProjectCapReached) as project:
+        call(Script("ok"), caps=Caps(monthly_usd=100.0, project_usd=0.05), project="blog-images")
+    for stop, name in ((monthly.value, "SPEND_MONTHLY_CAP_USD"), (project.value, "SPEND_PROJECT_CAP_USD_BLOG_IMAGES")):
+        text = str(stop)
+        assert "Ask the owner to raise it" in text and f"setting: {name}" in text
+        assert "Caps(" not in text and "set SPEND_" not in text and "export" not in text and "=" not in text
+        assert "would exceed" in text and "would pass" not in text  # plain words
+
+
+@pytest.mark.parametrize("env", [{"SPEND_PANIC": "1"}, {"SPEND_IMAGE_API_ENABLED": "0"}, {"SPEND_PANIC": "maybe"}])
+def test_kill_switch_messages_do_not_teach_how_to_lift_the_stop(call, env):
+    with pytest.raises(BrakeError) as stop:
+        call(Script("ok"), env=env)
+    text = str(stop.value)
+    assert "owner" in text and "unset" not in text and "delete" not in text and "export" not in text

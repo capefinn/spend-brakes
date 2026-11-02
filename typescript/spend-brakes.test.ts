@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkKillSwitch, fileLedger, guardedCall, makeCaps, memoryLedger } from "./spend-brakes.js";
+import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkKillSwitch, fileLedger, guardedCall, makeCaps, memoryLedger, runId } from "./spend-brakes.js";
 import type { Ledger } from "./spend-brakes.js";
 
 const noSleep = async () => {};
@@ -28,15 +28,15 @@ test("the estimate is on record before the call, and the real cost replaces it",
   assert.deepEqual(ledger.rows.map((r) => [r.event, r.usd]), [["reserve", 0.25], ["settle", 0.03]]);
 });
 
-test("monthly cap: the call that would pass the cap is stopped and never runs", async () => {
+test("monthly cap: the call that would exceed the cap is stopped and never runs", async () => {
   const ledger = memoryLedger(), fn = script("ok"), caps = makeCaps({ monthlyUsd: 0.25 });
   await guardedCall(fn, { ...base, ledger, caps });
   await guardedCall(fn, { ...base, ledger, caps });
-  await assert.rejects(guardedCall(fn, { ...base, ledger, caps }), brake("monthly_cap", /on purpose: set SPEND_MONTHLY_CAP_USD/));
+  await assert.rejects(guardedCall(fn, { ...base, ledger, caps }), brake("monthly_cap", /Ask the owner to raise it \(setting: SPEND_MONTHLY_CAP_USD\)/));
   assert.equal(fn.calls, 2);
 });
 
-test("a call that lands exactly on the cap is allowed, the next one is not", async () => {
+test("a call that reaches exactly the cap is allowed, the next one is not", async () => {
   const ledger = memoryLedger(), fn = script("ok"), caps = makeCaps({ monthlyUsd: 0.3 });
   for (let i = 0; i < 3; i++) await guardedCall(fn, { ...base, ledger, caps });
   await assert.rejects(guardedCall(fn, { ...base, ledger, caps }), brake("monthly_cap"));
@@ -60,7 +60,7 @@ test("job limit stops a loop; refused calls count too; another job is unaffected
 
 test("kill switch: master, one provider, stop file, unreadable value, read again on every call", async () => {
   const ledger = memoryLedger(), fn = script("ok");
-  for (const v of ["1", "true", "on", "yes"]) await assert.rejects(guardedCall(fn, { ...base, ledger, env: { SPEND_PANIC: v } }), brake("kill_switch", /SPEND_PANIC.*unset/));
+  for (const v of ["1", "true", "on", "yes"]) await assert.rejects(guardedCall(fn, { ...base, ledger, env: { SPEND_PANIC: v } }), brake("kill_switch", /SPEND_PANIC.*owner/));
   await assert.rejects(guardedCall(fn, { ...base, ledger, env: { SPEND_IMAGE_API_ENABLED: "0" } }), brake("kill_switch", /SPEND_IMAGE_API_ENABLED/));
   await assert.rejects(guardedCall(fn, { ...base, ledger, env: { SPEND_PANIC: "maybe" } }), brake("kill_switch", /cannot be read/));
   await assert.rejects(guardedCall(fn, { ...base, ledger, env: { SPEND_IMAGE_API_ENABLED: "disabled" } }), brake("kill_switch", /cannot be read/));
@@ -73,7 +73,7 @@ test("kill switch: master, one provider, stop file, unreadable value, read again
   const env = { SPEND_STOP_FILE: stopFile };
   await guardedCall(fn, { ...base, ledger, env });
   writeFileSync(stopFile, "");
-  await assert.rejects(guardedCall(fn, { ...base, ledger, env }), brake("kill_switch", /delete that file/));
+  await assert.rejects(guardedCall(fn, { ...base, ledger, env }), brake("kill_switch", /owner removes that file/));
   rmSync(stopFile);
   await guardedCall(fn, { ...base, ledger, env });
   assert.equal(fn.calls, 2);
@@ -100,6 +100,11 @@ test("hard ceiling covers retries too, and unreadable settings are refused", asy
   await assert.rejects(guardedCall(fn, { ...base, ledger: memoryLedger(), maxRetries: -1 }), brake("bad_setting"));
   for (const bad of [Number.NaN, Infinity, -1]) await assert.rejects(guardedCall(fn, { ...base, ledger: memoryLedger(), estimateUsd: bad }), brake("bad_setting"));
   assert.throws(() => capsFromEnv("p", { SPEND_MONTHLY_CAP_USD: "abc" }), brake("bad_setting"));
+  for (const bad of ["nan", "NaN", "inf", "-inf", "1e400", "Infinity", "0x10", "2.5"]) {
+    assert.throws(() => capsFromEnv("p", { SPEND_MAX_CALLS_PER_JOB: bad }), brake("bad_setting"), `SPEND_MAX_CALLS_PER_JOB=${bad}`);
+  }
+  assert.throws(() => capsFromEnv("p", { SPEND_MONTHLY_CAP_USD: "1e400" }), brake("bad_setting"));
+  assert.throws(() => capsFromEnv("p", { SPEND_MAX_CALLS_PER_JOB: "1e300" }), brake("hard_ceiling"));
   assert.equal(fn.calls, 0);
 });
 
@@ -166,7 +171,7 @@ test("a broken cost reader keeps the result and the estimate", async () => {
   assert.equal(ledger.rows.at(-1)?.usd, 0.25);
 });
 
-test("many calls at the same time cannot pass the same cap (memory ledger)", async () => {
+test("many calls at the same time cannot exceed the same cap (memory ledger)", async () => {
   const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 1, maxCallsPerJob: 20 });
   let ran = 0;
   const results = await Promise.allSettled(Array.from({ length: 50 }, (_, i) => guardedCall(async () => { ran++; return "ok"; }, { ...base, ledger, caps, job: `job-${i}` })));
@@ -186,7 +191,7 @@ test("file ledger: concurrent appends are all kept whole, the cap holds, and old
   assert.ok(readFileSync(path, "utf8").startsWith(text)); // only added to
 });
 
-test("file ledger reads rows in the format the Python package writes, and skips unreadable lines", async () => {
+test("file ledger reads rows in the format the Python package writes (unreadable lines only with the opt-in)", async () => {
   const path = tmpFile(), month = new Date().toISOString().slice(0, 7);
   const row = (o: object) => JSON.stringify({ t: `${month}-15T10:00:00+00:00`, provider: "image_api", ...o });
   writeFileSync(path, [
@@ -196,8 +201,103 @@ test("file ledger reads rows in the format the Python package writes, and skips 
     "not json",
     row({ event: "reserve", id: "c1", project: "proj-a", job: "j", usd: -9 }),
   ].join("\n") + "\n");
-  const ledger = fileLedger(path);
+  await assert.rejects(guardedCall(async () => "ok", { ...base, ledger: fileLedger(path), estimateUsd: 0.2 }), brake("ledger_unreadable"));
+  const ledger = fileLedger(path, { skipUnreadable: true });
   await assert.rejects(guardedCall(async () => "ok", { ...base, ledger, estimateUsd: 0.2, caps: makeCaps({ monthlyUsd: 1.5 }) }), brake("monthly_cap", /\$1\.40/)); // 0.4 + 1.0
   await assert.rejects(guardedCall(async () => "ok", { ...base, ledger, estimateUsd: 0.2, caps: makeCaps({ monthlyUsd: 100, projectUsd: 0.5 }) }), brake("project_cap", /\$0\.40/));
   assert.ok(existsSync(path));
+});
+
+test("a job name is required and a run id makes a new one every time", async () => {
+  const fn = script("ok");
+  // @ts-expect-error job is required: there is no default name
+  await assert.rejects(guardedCall(fn, { estimateUsd: 0.1, project: "p", provider: "x", ledger: memoryLedger(), env: {}, caps: makeCaps() }), brake("bad_setting", /job is required/));
+  await assert.rejects(guardedCall(fn, { ...base, ledger: memoryLedger(), job: "" }), brake("bad_setting"));
+  assert.equal(fn.calls, 0);
+  const ids = new Set(Array.from({ length: 50 }, () => runId()));
+  assert.equal(ids.size, 50);
+  for (const id of ids) assert.match(id, /^\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+  // a new run has its own count; a reused name keeps its old count
+  const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, maxCallsPerJob: 2 });
+  for (let i = 0; i < 4; i++) await guardedCall(script("ok"), { ...base, ledger, caps, job: `batch-${runId()}` });
+  const reused = `batch-${runId()}`;
+  await guardedCall(script("ok"), { ...base, ledger, caps, job: reused });
+  await guardedCall(script("ok"), { ...base, ledger, caps, job: reused });
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger, caps, job: reused }), brake("job_limit"));
+});
+
+test("stop messages name the setting and do not teach how to lift the stop", async () => {
+  const stops: BrakeError[] = [];
+  const grab = async (p: Promise<unknown>) => { try { await p; } catch (e) { stops.push(e as BrakeError); } };
+  await grab(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), caps: makeCaps({ monthlyUsd: 0.05 }) }));
+  await grab(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), caps: makeCaps({ monthlyUsd: 100, projectUsd: 0.05 }) }));
+  await grab(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), env: { SPEND_PANIC: "1" } }));
+  await grab(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), env: { SPEND_IMAGE_API_ENABLED: "0" } }));
+  await grab(guardedCall(script(httpError(402)), { ...base, ledger: memoryLedger() }));
+  assert.equal(stops.length, 5);
+  for (const stop of stops) {
+    assert.match(stop.message, /owner/);
+    assert.doesNotMatch(stop.message, /makeCaps\(|set SPEND_|unset|delete|export|would pass/);
+  }
+  assert.match(stops[0].message, /would exceed the cap/);
+});
+
+test("AbortError (the caller cancelled) is not retried; TimeoutError is", async () => {
+  const cancelled = script(Object.assign(new Error("cancelled"), { name: "AbortError" }));
+  await assert.rejects(guardedCall(cancelled, { ...base, ledger: memoryLedger(), maxRetries: 3 }), (e: unknown) => !(e instanceof BrakeError) && (e as Error).name === "AbortError");
+  assert.equal(cancelled.calls, 1);
+  const slow = script(Object.assign(new Error("slow"), { name: "TimeoutError" }));
+  await assert.rejects(guardedCall(slow, { ...base, ledger: memoryLedger(), maxRetries: 2 }), brake("retries_exhausted"));
+  assert.equal(slow.calls, 3);
+});
+
+// ---- a damaged ledger must stop the calls ----------------------------------------------------------------------
+const goodRow = (month: string, o: object = {}) => ({ t: `${month}-15T10:00:00.000Z`, id: "a1", event: "reserve", project: "proj-a", provider: "image_api", job: "j", usd: 19.99, ...o });
+const thisMonth = () => new Date().toISOString().slice(0, 7);
+
+test("one broken line can no longer turn the spend into zero: calls stop, nothing is written", async () => {
+  const garbage = ["not json", '{"event":"reserve","id":"x","project":"a","job":"j","t":"1999-01-01T00:00:00Z","usd":-5}', '{"event":"reserve","id":"y","project":"a","job":"j","usd":1}',
+    '{"event":"reserve","id":"y","job":"j","t":"1999-01-01T00:00:00Z","usd":1}', "[1,2]", "null", "{"];
+  for (const bad of garbage) {
+    const path = tmpFile();
+    writeFileSync(path, JSON.stringify(goodRow(thisMonth())) + "\n" + bad + "\n");
+    const before = readFileSync(path, "utf8"), fn = script("ok");
+    await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path), estimateUsd: 0.05, caps: makeCaps({ monthlyUsd: 20 }) }),
+      brake("ledger_unreadable", /line 2\)?.*make a copy of the file/));
+    assert.equal(fn.calls, 0, bad);
+    assert.equal(readFileSync(path, "utf8"), before); // nothing was added to a damaged file
+  }
+});
+
+test("skipping unreadable lines is an explicit choice (option or environment) and says so in the numbers", async () => {
+  const path = tmpFile();
+  writeFileSync(path, JSON.stringify(goodRow(thisMonth())) + "\nnot json\n");
+  const fn = script("ok");
+  // the readable $19.99 still counts, so the cap of $20 stops a call of $0.05; the skipped line is simply not counted
+  await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path, { skipUnreadable: true }), estimateUsd: 0.05, caps: makeCaps({ monthlyUsd: 20 }) }), brake("monthly_cap"));
+  await guardedCall(fn, { ...base, ledger: fileLedger(path, { skipUnreadable: true }), estimateUsd: 0.005, caps: makeCaps({ monthlyUsd: 20 }) });
+  process.env.SPEND_BRAKES_SKIP_UNREADABLE = "1";
+  try { await guardedCall(fn, { ...base, ledger: fileLedger(path), estimateUsd: 0.001, caps: makeCaps({ monthlyUsd: 100 }) }); }
+  finally { delete process.env.SPEND_BRAKES_SKIP_UNREADABLE; }
+  await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path), estimateUsd: 0.001, caps: makeCaps({ monthlyUsd: 100 }) }), brake("ledger_unreadable")); // off by default again
+  assert.equal(fn.calls, 2);
+});
+
+test("a row cut off by a crash is reported, and the next row is not swallowed by it", async () => {
+  const path = tmpFile(), fn = script("ok");
+  writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 })) + '\n{"t":"cut');
+  await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path), caps: makeCaps({ monthlyUsd: 100 }) }), brake("ledger_unreadable"));
+  await guardedCall(fn, { ...base, ledger: fileLedger(path, { skipUnreadable: true }), caps: makeCaps({ monthlyUsd: 100 }) });
+  const lines = readFileSync(path, "utf8").split("\n");
+  assert.equal(lines.at(-1), "");
+  assert.equal(JSON.parse(lines.at(-2)!).event, "settle"); // the new rows are whole lines of their own
+  assert.equal(JSON.parse(lines.at(-3)!).event, "reserve");
+  assert.equal(lines[1], '{"t":"cut'); // the damaged line is still there to be repaired, not hidden
+});
+
+test("a complete last row that only lacks its end-of-line mark is fine", async () => {
+  const path = tmpFile(), fn = script("ok");
+  writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 }))); // no final newline
+  await guardedCall(fn, { ...base, ledger: fileLedger(path), caps: makeCaps({ monthlyUsd: 100 }) });
+  assert.equal(readFileSync(path, "utf8").trim().split("\n").length, 3);
 });

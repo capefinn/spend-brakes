@@ -11,7 +11,7 @@ class ConfigError(SpendBrakesError):
 
 
 class BrakeError(SpendBrakesError):
-    """A brake stopped the call. `.brake` names it, the message says how to change it on purpose."""
+    """A brake stopped the call. `.brake` names it. The message names the setting; the owner decides to change it."""
 
     def __init__(self, brake: str, message: str):
         super().__init__(message)
@@ -59,3 +59,10 @@ class RetriesExhausted(BrakeError):
     def __init__(self, attempts: int, message: str):
         super().__init__("retries_exhausted", message)
         self.attempts = attempts
+
+
+class LedgerUnreadable(BrakeError):
+    """The ledger has a line that cannot be read, so the real spend is not known. No call is allowed."""
+
+    def __init__(self, message: str):
+        super().__init__("ledger_unreadable", message)

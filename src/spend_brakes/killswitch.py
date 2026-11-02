@@ -4,7 +4,7 @@
   SPEND_<PROVIDER>_ENABLED=0    stops one provider, e.g. SPEND_IMAGE_API_ENABLED=0
   SPEND_STOP_FILE=/some/path    if that file exists, every paid call stops (reaches processes that are already running)
 
-A value that cannot be read (for example "ofF!") counts as STOP. A brake must fail on the safe side.
+A value that cannot be read (for example "ofF!") counts as STOP. A brake must fail in the safe direction.
 """
 from __future__ import annotations
 
@@ -38,19 +38,19 @@ def check_kill_switch(provider: str, env: Optional[Mapping[str, str]] = None) ->
     if panic in _ON:
         raise KillSwitchOn(
             f"Stopped by the kill switch: {ENV_PANIC} is on, so no paid call is allowed. "
-            f"To allow calls again on purpose, unset {ENV_PANIC} or set it to 0."
+            f"Only the owner turns it off (setting: {ENV_PANIC})."
         )
     if panic is not None and panic not in _OFF:
         raise KillSwitchOn(
-            f"Stopped by the kill switch: {ENV_PANIC}={panic!r} cannot be read, so it counts as ON (the safe side). "
-            f"Set it to 1 (stop) or 0 (go)."
+            f"Stopped by the kill switch: {ENV_PANIC}={panic!r} cannot be read, so it counts as ON (the safe choice). "
+            f"Ask the owner to fix the value (setting: {ENV_PANIC}; 1 means stop, 0 means go)."
         )
 
     stop_file = (env.get(ENV_STOP_FILE) or "").strip()
     if stop_file and Path(stop_file).exists():
         raise KillSwitchOn(
             f"Stopped by the kill switch: the stop file named in {ENV_STOP_FILE} exists ({stop_file}). "
-            "To allow calls again on purpose, delete that file."
+            "Only the owner removes that file."
         )
 
     name = provider_env_name(provider)
@@ -60,9 +60,9 @@ def check_kill_switch(provider: str, env: Optional[Mapping[str, str]] = None) ->
     if value in _OFF:
         raise KillSwitchOn(
             f"Stopped by the kill switch: {name} is {value}, so provider {provider!r} is switched off. "
-            f"To allow calls again on purpose, set {name}=1 or unset it."
+            f"Only the owner turns it on again (setting: {name})."
         )
     raise KillSwitchOn(
         f"Stopped by the kill switch: {name}={value!r} cannot be read, so provider {provider!r} counts as OFF "
-        f"(the safe side). Set it to 1 (go) or 0 (stop)."
+        f"(the safe choice). Ask the owner to fix the value (setting: {name}; 1 means go, 0 means stop)."
     )

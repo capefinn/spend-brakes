@@ -1,7 +1,7 @@
 // spend-brakes.ts - spend brakes for Node and serverless code that call paid APIs. One file, no dependencies.
 // Same five brakes and the same ledger row format as the Python package, so both can share one ledger file.
 // Brakes, checked before EVERY attempt: kill switch, job limit, project cap, monthly cap. Then the retry rules.
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname } from "node:path";
 
 // Part of the code on purpose: no argument and no environment variable can raise these two numbers.
@@ -11,9 +11,9 @@ const DEFAULT_MONTHLY_CAP_USD = 20; // an example number: set your own
 const DEFAULT_MAX_CALLS_PER_JOB = 6;
 
 type Env = Record<string, string | undefined>;
-export type BrakeName = "kill_switch" | "monthly_cap" | "project_cap" | "job_limit" | "hard_ceiling" | "no_retry" | "retries_exhausted" | "bad_setting";
+export type BrakeName = "kill_switch" | "monthly_cap" | "project_cap" | "job_limit" | "hard_ceiling" | "no_retry" | "retries_exhausted" | "ledger_unreadable" | "bad_setting";
 
-/** Every stop is a BrakeError. `.brake` says which brake; the message says how to change it on purpose. */
+/** Every stop is a BrakeError. `.brake` says which brake; the message names the setting, and the owner decides. */
 export class BrakeError extends Error {
   readonly brake: BrakeName;
   readonly status?: number;
@@ -44,7 +44,7 @@ export function makeCaps(c: { monthlyUsd?: number; projectUsd?: number; maxCalls
   const n = c.maxCallsPerJob ?? DEFAULT_MAX_CALLS_PER_JOB;
   if (!Number.isInteger(n) || n < 1) throw new BrakeError("bad_setting", `maxCallsPerJob must be a whole number of 1 or more (got ${String(n)}).`);
   if (n > HARD_MAX_CALLS_PER_JOB) {
-    throw new BrakeError("hard_ceiling", `maxCallsPerJob=${n} is above the hard ceiling of ${HARD_MAX_CALLS_PER_JOB}. The ceiling is written into the code on purpose, so no setting can raise it. To change it, edit HARD_MAX_CALLS_PER_JOB in this file and have that change reviewed.`);
+    throw new BrakeError("hard_ceiling", `maxCallsPerJob=${n} is above the hard ceiling of ${HARD_MAX_CALLS_PER_JOB}. The ceiling is written into the code on purpose, so no setting can raise it. Only the owner can change it, in the code (HARD_MAX_CALLS_PER_JOB in this file), with a review.`);
   }
   return Object.freeze({
     monthlyUsd: money(c.monthlyUsd ?? DEFAULT_MONTHLY_CAP_USD, "monthlyUsd"),
@@ -58,7 +58,7 @@ export function capsFromEnv(project: string, env: Env = process.env): Caps {
   const num = (name: string): number | undefined => {
     const raw = (env[name] ?? "").trim();
     if (!raw) return undefined;
-    const v = Number(raw);
+    const v = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(raw) ? Number(raw) : Number.NaN;
     if (!Number.isFinite(v)) throw new BrakeError("bad_setting", `${name}="${raw}" is not a number. Set it to a plain number such as 20.`);
     return v;
   };
@@ -67,23 +67,23 @@ export function capsFromEnv(project: string, env: Env = process.env): Caps {
 
 // ---- kill switch ----------------------------------------------------------------------------------------------
 // SPEND_PANIC=1 stops everything. SPEND_<PROVIDER>_ENABLED=0 stops one provider. If the file named in
-// SPEND_STOP_FILE exists, everything stops. A value that cannot be read counts as STOP (the safe side).
+// SPEND_STOP_FILE exists, everything stops. A value that cannot be read counts as STOP (the safe choice).
 export function checkKillSwitch(provider: string, env: Env = process.env): void {
   const stop = (m: string) => { throw new BrakeError("kill_switch", `Stopped by the kill switch: ${m}`); };
   const word = (name: string) => (env[name] ?? "").trim().toLowerCase();
   const ON = ["1", "true", "on", "yes"], OFF = ["0", "false", "off", "no"];
 
   const panic = word("SPEND_PANIC");
-  if (ON.includes(panic)) stop("SPEND_PANIC is on, so no paid call is allowed. To allow calls again on purpose, unset SPEND_PANIC or set it to 0.");
-  if (panic && !OFF.includes(panic)) stop(`SPEND_PANIC="${panic}" cannot be read, so it counts as ON (the safe side). Set it to 1 (stop) or 0 (go).`);
+  if (ON.includes(panic)) stop("SPEND_PANIC is on, so no paid call is allowed. Only the owner turns it off (setting: SPEND_PANIC).");
+  if (panic && !OFF.includes(panic)) stop(`SPEND_PANIC="${panic}" cannot be read, so it counts as ON (the safe choice). Ask the owner to fix the value (setting: SPEND_PANIC; 1 means stop, 0 means go).`);
 
   const file = (env.SPEND_STOP_FILE ?? "").trim();
-  if (file && existsSync(file)) stop(`the stop file named in SPEND_STOP_FILE exists (${file}). To allow calls again on purpose, delete that file.`);
+  if (file && existsSync(file)) stop(`the stop file named in SPEND_STOP_FILE exists (${file}). Only the owner removes that file.`);
 
   const name = `SPEND_${envWord(provider)}_ENABLED`, value = word(name);
   if (!value || ON.includes(value)) return;
-  if (OFF.includes(value)) stop(`${name} is ${value}, so provider "${provider}" is switched off. To allow calls again on purpose, set ${name}=1 or unset it.`);
-  stop(`${name}="${value}" cannot be read, so provider "${provider}" counts as OFF (the safe side). Set it to 1 (go) or 0 (stop).`);
+  if (OFF.includes(value)) stop(`${name} is ${value}, so provider "${provider}" is switched off. Only the owner turns it on again (setting: ${name}).`);
+  stop(`${name}="${value}" cannot be read, so provider "${provider}" counts as OFF (the safe choice). Ask the owner to fix the value (setting: ${name}; 1 means go, 0 means stop).`);
 }
 
 // ---- ledger ---------------------------------------------------------------------------------------------------
@@ -97,7 +97,13 @@ export interface Ledger {
   settle(e: { id: string; project: string; provider: string; job: string; usd: number; outcome: "ok" | "rejected" | "error" }): Promise<void>;
 }
 
-const rowOk = (r: any): r is Row => r && typeof r === "object" && (r.event === "reserve" || r.event === "settle") && typeof r.id === "string" && typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd >= 0;
+// A row we can count with: every field the totals use must be there and make sense.
+const rowOk = (r: any): r is Row => !!r && typeof r === "object" && !Array.isArray(r) && (r.event === "reserve" || r.event === "settle")
+  && typeof r.id === "string" && typeof r.project === "string" && typeof r.job === "string"
+  && typeof r.t === "string" && /^\d{4}-\d{2}-\d{2}T/.test(r.t) && typeof r.usd === "number" && Number.isFinite(r.usd) && r.usd >= 0;
+
+/** A new id for every run of a script, to use inside a job name: job: "batch-" + runId(). */
+export const runId = (): string => new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z") + "-" + globalThis.crypto.randomUUID().slice(0, 6);
 
 function totalsOf(rows: Row[], project: string, job: string, month: string): Totals {
   const calls = new Map<string, { month: string; project: string; job: string; usd: number }>();
@@ -137,14 +143,34 @@ export function memoryLedger(now: () => Date = () => new Date()): Ledger & { row
 }
 
 /** A JSONL file. Every row is one append (the system adds the whole line or none of it). Check-and-record is safe
- *  inside one process only; for several processes or servers, write a Ledger over a database transaction instead. */
-export function fileLedger(path: string, now: () => Date = () => new Date()): Ledger {
+ *  inside one process only; for several processes or servers, write a Ledger over a database transaction instead.
+ *  A line that cannot be read means the real spend is not known, so by default every call is REFUSED (ledger_unreadable)
+ *  until the owner repairs the file. Skipping such lines is an explicit choice: { skipUnreadable: true } or
+ *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never swallowed. */
+export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadable?: boolean } = {}): Ledger {
+  const skip = opts.skipUnreadable ?? ["1", "true", "on", "yes"].includes((process.env.SPEND_BRAKES_SKIP_UNREADABLE ?? "").trim().toLowerCase());
   const read = (): Row[] => {
     if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8").split("\n").flatMap((line) => { try { const r = JSON.parse(line); return rowOk(r) ? [r] : []; } catch { return []; } });
+    const rows: Row[] = [], bad: number[] = [];
+    readFileSync(path, "utf8").split("\n").forEach((line, i) => {
+      if (!line.trim()) return;
+      try { const r = JSON.parse(line); if (rowOk(r)) rows.push(r); else bad.push(i + 1); } catch { bad.push(i + 1); }
+    });
+    if (bad.length && !skip) {
+      throw new BrakeError("ledger_unreadable", `Stopped: the ledger file ${path} has ${bad.length} line(s) that cannot be read (line ${bad.slice(0, 5).join(", ")}${bad.length > 5 ? " and more" : ""}). With an unreadable line the real spend is not known, so no paid call is allowed. To repair it, ask the owner to make a copy of the file, then fix or remove only the damaged line(s). Skipping them is the owner's choice and not a repair: the money on those lines is then not counted (setting: SPEND_BRAKES_SKIP_UNREADABLE).`);
+    }
+    return rows;
   };
-  const append = (row: Row) => { mkdirSync(dirname(path), { recursive: true }); appendFileSync(path, JSON.stringify(row) + "\n", { mode: 0o600 }); };
-  return rowsLedger({ read, append }, now);
+  const append = (row: Row) => {
+    mkdirSync(dirname(path), { recursive: true });
+    let line = JSON.stringify(row) + "\n";
+    if (existsSync(path)) { // an earlier write may have been cut off without its end-of-line mark
+      const fd = openSync(path, "r");
+      try { const size = fstatSync(fd).size, last = Buffer.alloc(1); if (size > 0 && readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 10) line = "\n" + line; } finally { closeSync(fd); }
+    }
+    appendFileSync(path, line, { mode: 0o600 });
+  };
+  return rowsLedger({ read, append }, opts.now ?? (() => new Date()));
 }
 
 // ---- guarded call ---------------------------------------------------------------------------------------------
@@ -156,14 +182,17 @@ export function statusOf(x: any): number | undefined {
   const pick = (o: any) => [o?.status, o?.statusCode, o?.status_code, o?.code].find((v) => Number.isInteger(v) && v >= 100 && v <= 599);
   return pick(x) ?? pick(x?.response);
 }
+// An AbortError means the caller cancelled on purpose: never retry it. A TimeoutError is retried.
 const isTransient = (e: any): boolean => {
   const s = statusOf(e);
   if (s !== undefined) return s >= 500;
-  return ["TimeoutError", "AbortError"].includes(e?.name) || NET_CODES.has(e?.code) || NET_CODES.has(e?.cause?.code) || (e instanceof TypeError && e.message === "fetch failed");
+  return e?.name === "TimeoutError" || NET_CODES.has(e?.code) || NET_CODES.has(e?.cause?.code) || (e instanceof TypeError && e.message === "fetch failed");
 };
 
 export interface CallOptions {
-  estimateUsd: number; project: string; provider: string; job?: string; ledger: Ledger;
+  estimateUsd: number; project: string; provider: string; ledger: Ledger;
+  /** Required, and NEW for every run of your script, for example "batch-" + runId(). A name that is used again keeps its old call count. */
+  job: string;
   caps?: Caps; maxRetries?: number; retryDelayMs?: number;
   /** Read the real cost from the result. If it fails or gives a bad number, the estimate stays. */
   costFromResult?: (result: any) => number;
@@ -172,18 +201,19 @@ export interface CallOptions {
 
 /** Run `fn` only after every brake agrees. `fn` must throw on HTTP errors, or return an object with .status (fetch does). */
 export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Promise<T> {
-  const env = o.env ?? process.env, job = o.job ?? "default", maxRetries = o.maxRetries ?? 1;
+  const env = o.env ?? process.env, job = o.job, maxRetries = o.maxRetries ?? 1;
+  if (typeof job !== "string" || !job) throw new BrakeError("bad_setting", "job is required: a name that is new for every run of your script, for example \"batch-\" + runId().");
   const estimate = money(o.estimateUsd, "estimateUsd");
   if (!Number.isInteger(maxRetries) || maxRetries < 0) throw new BrakeError("bad_setting", `maxRetries must be a whole number from 0 to ${HARD_MAX_RETRIES} (got ${String(maxRetries)}).`);
-  if (maxRetries > HARD_MAX_RETRIES) throw new BrakeError("hard_ceiling", `maxRetries=${maxRetries} is above the hard ceiling of ${HARD_MAX_RETRIES}. The ceiling is written into the code on purpose, so no setting can raise it. To change it, edit HARD_MAX_RETRIES in this file and have that change reviewed.`);
+  if (maxRetries > HARD_MAX_RETRIES) throw new BrakeError("hard_ceiling", `maxRetries=${maxRetries} is above the hard ceiling of ${HARD_MAX_RETRIES}. The ceiling is written into the code on purpose, so no setting can raise it. Only the owner can change it, in the code (HARD_MAX_RETRIES in this file), with a review.`);
   const caps = o.caps ?? capsFromEnv(o.project, env);
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const names = { project: o.project, provider: o.provider, job };
 
   const check = (t: Totals) => {
-    if (t.jobCalls >= caps.maxCallsPerJob) throw new BrakeError("job_limit", `Stopped by the job limit: job "${job}" already has ${t.jobCalls} recorded calls (limit ${caps.maxCallsPerJob}, refused calls count too). Look at why the job needs more calls. To allow more on purpose: set SPEND_MAX_CALLS_PER_JOB or makeCaps({ maxCallsPerJob }), up to the hard ceiling written in the code (HARD_MAX_CALLS_PER_JOB), which no setting can raise.`);
-    if (caps.projectUsd !== undefined && round6(t.projectUsd + estimate) > caps.projectUsd) throw new BrakeError("project_cap", `Stopped by the project cap: project "${o.project}" spent ${usd(t.projectUsd)} this month, and this call is about ${usd(estimate)}, which would pass the cap of ${usd(caps.projectUsd)}. To raise it on purpose: set SPEND_PROJECT_CAP_USD_${envWord(o.project)} or makeCaps({ projectUsd }).`);
-    if (round6(t.monthUsd + estimate) > caps.monthlyUsd) throw new BrakeError("monthly_cap", `Stopped by the monthly cap: all projects spent ${usd(t.monthUsd)} this month, and this call is about ${usd(estimate)}, which would pass the cap of ${usd(caps.monthlyUsd)}. To raise it on purpose: set SPEND_MONTHLY_CAP_USD or makeCaps({ monthlyUsd }).`);
+    if (t.jobCalls >= caps.maxCallsPerJob) throw new BrakeError("job_limit", `Stopped by the job limit: job "${job}" already has ${t.jobCalls} recorded calls (limit ${caps.maxCallsPerJob}, refused calls count too). Look at why the job needs more calls. Ask the owner if the limit should change (setting: SPEND_MAX_CALLS_PER_JOB); the hard ceiling in the code cannot be raised by a setting.`);
+    if (caps.projectUsd !== undefined && round6(t.projectUsd + estimate) > caps.projectUsd) throw new BrakeError("project_cap", `Stopped by the project cap: project "${o.project}" spent ${usd(t.projectUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.projectUsd)}. Ask the owner to raise it (setting: SPEND_PROJECT_CAP_USD_${envWord(o.project)}).`);
+    if (round6(t.monthUsd + estimate) > caps.monthlyUsd) throw new BrakeError("monthly_cap", `Stopped by the monthly cap: all projects spent ${usd(t.monthUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.monthlyUsd)}. Ask the owner to raise it (setting: SPEND_MONTHLY_CAP_USD).`);
   };
 
   for (let attempt = 1; ; attempt++) {
@@ -198,11 +228,11 @@ export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Prom
       const status = statusOf(error);
       if (status !== undefined && status in NO_RETRY) {
         await o.ledger.settle({ id, ...names, usd: 0, outcome: "rejected" }); // refused before any work: nothing billed
-        throw new BrakeError("no_retry", `Not retried: the provider answered ${status} (${NO_RETRY[status]}). A repeat cannot fix this and can make it worse. Fix the cause (key, payment, permission or call rate), then run it again on purpose.`, { status, cause: error });
+        throw new BrakeError("no_retry", `Not retried: the provider answered ${status} (${NO_RETRY[status]}). A repeat cannot fix this and can make it worse. The owner must fix the cause (key, payment, permission or call rate) before the next run.`, { status, cause: error });
       }
       await o.ledger.settle({ id, ...names, usd: estimate, outcome: "error" }); // may have been billed: keep the estimate
       if (!isTransient(error)) throw error;
-      if (attempt > maxRetries) throw new BrakeError("retries_exhausted", `Gave up after ${attempt} attempt(s): the provider kept answering with a server error or a timeout. Every attempt is counted in the ledger as a possible cost. Check the provider's status before you run it again. To allow more tries on purpose: pass maxRetries (highest allowed: ${HARD_MAX_RETRIES}).`, { cause: error });
+      if (attempt > maxRetries) throw new BrakeError("retries_exhausted", `Gave up after ${attempt} attempt(s): the provider kept answering with a server error or a timeout. Every attempt is counted in the ledger as a possible cost. Check the provider's status before you run it again. More tries are the owner's choice (setting: maxRetries; highest allowed: ${HARD_MAX_RETRIES}).`, { cause: error });
       await sleep((o.retryDelayMs ?? 2_000) * attempt);
       continue;
     }

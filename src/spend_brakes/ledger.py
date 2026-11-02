@@ -6,8 +6,16 @@ Each paid call writes two rows with the same id:
 
 The cost of a call is the usd of its last row. Rows are never edited or deleted by this package.
 The check against the caps and the reserve row are written under one lock, so two processes cannot both
-pass the same cap. The lock uses fcntl (macOS, Linux). Without fcntl the lock works inside one process only.
-Months are UTC calendar months.
+exceed the same cap. The lock uses fcntl (macOS, Linux; it may not work on network file systems).
+Without fcntl the lock works inside one process only. Months are UTC calendar months.
+
+A line that cannot be read means the real spend is not known. By default the ledger then REFUSES to give totals,
+so no call is allowed until the owner repairs the file. Skipping unreadable lines is an explicit opt-in
+(skip_unreadable=True, or SPEND_BRAKES_SKIP_UNREADABLE=1).
+
+Writes are guarded against cut-off rows: a row is written with one call (the rest is completed if the system writes
+only part of it), and if an earlier write left a line without its end-of-line mark, the next row starts on a new line,
+so a damaged line never swallows a good one. The damaged line itself is then reported as unreadable.
 """
 from __future__ import annotations
 
@@ -16,14 +24,16 @@ import datetime as _dt
 import json
 import math
 import os
+import re
 import threading
 import uuid
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from .caps import check_money
-from .errors import ConfigError
+from .errors import ConfigError, LedgerUnreadable
 
 try:  # POSIX only
     import fcntl
@@ -31,16 +41,18 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 ENV_LEDGER = "SPEND_BRAKES_LEDGER"
-MAX_NAME_LENGTH = 200  # keeps every row short enough to be written in one piece
+ENV_SKIP_UNREADABLE = "SPEND_BRAKES_SKIP_UNREADABLE"
+MAX_NAME_LENGTH = 200  # keeps every row short
 _THREAD_LOCK = threading.Lock()
+_TIME_START = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 
 
 @dataclass(frozen=True)
 class Totals:
     month_usd: float  # all projects, this month
     project_usd: float  # this project, this month
-    job_calls: int  # calls ever recorded for this project + job (refused calls count too)
-    unreadable_lines: int  # lines that could not be read (they are skipped)
+    job_calls: int  # calls recorded for this project + job (refused calls count too)
+    unreadable_lines: int  # lines skipped because of skip_unreadable=True (always 0 otherwise)
 
 
 def default_path(env: Optional[Mapping[str, str]] = None) -> Path:
@@ -49,15 +61,32 @@ def default_path(env: Optional[Mapping[str, str]] = None) -> Path:
     return Path(custom) if custom else Path.home() / ".spend-brakes" / "ledger.jsonl"
 
 
+def _skip_from_env(env: Mapping[str, str]) -> bool:
+    raw = (env.get(ENV_SKIP_UNREADABLE) or "").strip().lower()
+    if raw in ("", "0", "false", "off", "no"):
+        return False
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    raise ConfigError(f"{ENV_SKIP_UNREADABLE}={raw!r} cannot be read. Use 1 or 0.")
+
+
+def run_id() -> str:
+    """A new id for every run of a script, to use inside a job name: job="batch-" + run_id()."""
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+
+
 class Ledger:
-    def __init__(self, path: Optional[os.PathLike] = None, clock: Optional[Callable[[], _dt.datetime]] = None):
+    def __init__(self, path: Optional[os.PathLike] = None, clock: Optional[Callable[[], _dt.datetime]] = None,
+                 skip_unreadable: bool = False):
         self.path = Path(path) if path is not None else default_path()
         self.lock_path = self.path.with_name(self.path.name + ".lock")
+        self.skip_unreadable = skip_unreadable
         self._clock = clock or (lambda: _dt.datetime.now(_dt.timezone.utc))
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Ledger":
-        return cls(default_path(env))
+        env = os.environ if env is None else env
+        return cls(default_path(env), skip_unreadable=_skip_from_env(env))
 
     # ---- writing -------------------------------------------------------------------------------------------
 
@@ -65,12 +94,13 @@ class Ledger:
                 check: Callable[[Totals], None]) -> str:
         """Under the lock: read the totals, let `check` refuse (it raises), then write the reserve row."""
         for label, value in (("project", project), ("provider", provider), ("job", job)):
-            if not value or len(value) > MAX_NAME_LENGTH:
+            if not isinstance(value, str) or not value or len(value) > MAX_NAME_LENGTH:
                 raise ConfigError(f"{label} must be a name of 1 to {MAX_NAME_LENGTH} characters.")
         check_money(usd, "estimate_usd")
         with self._locked():
             rows, bad = self._read_rows()
-            check(self._totals(rows, bad, project, job))
+            self._require_readable(bad)
+            check(self._totals(rows, len(bad), project, job))
             call_id = uuid.uuid4().hex
             self._append({"event": "reserve", "id": call_id, "project": project, "provider": provider,
                           "job": job, "usd": usd})
@@ -79,14 +109,17 @@ class Ledger:
     def settle(self, call_id: str, *, project: str, provider: str, job: str, usd: float, outcome: str) -> None:
         """Write the final cost of a call. `outcome` is ok, rejected or error."""
         check_money(usd, "usd")
-        self._append({"event": "settle", "id": call_id, "project": project, "provider": provider,
-                      "job": job, "usd": usd, "outcome": outcome})
+        with self._locked():
+            self._append({"event": "settle", "id": call_id, "project": project, "provider": provider,
+                          "job": job, "usd": usd, "outcome": outcome})
 
     # ---- reading -------------------------------------------------------------------------------------------
 
     def totals(self, project: str, job: str = "") -> Totals:
+        """Raises LedgerUnreadable when a line cannot be read (unless skip_unreadable is on)."""
         rows, bad = self._read_rows()
-        return self._totals(rows, bad, project, job)
+        self._require_readable(bad)
+        return self._totals(rows, len(bad), project, job)
 
     def month_total(self) -> float:
         return self.totals("").month_usd
@@ -98,18 +131,33 @@ class Ledger:
         return self.totals(project, job).job_calls
 
     def rows(self) -> List[dict]:
+        """The readable rows. Never raises for a damaged file, so it can be used to look at one."""
         return self._read_rows()[0]
+
+    def unreadable_line_numbers(self) -> List[int]:
+        """Line numbers (first line is 1) that cannot be read. Empty when the file is whole."""
+        return self._read_rows()[1]
 
     # ---- inside -------------------------------------------------------------------------------------------
 
     def _append(self, row: dict) -> None:
+        """Add one row. Call it only while holding the lock."""
         row = {"t": self._clock().isoformat(timespec="seconds"), **row}
         data = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            if os.write(fd, data) != len(data):  # one write call: the system appends the whole line or none of it
-                raise OSError("The ledger row was only partly written. Check the disk and the ledger file.")
+            size = os.fstat(fd).st_size
+            if size:
+                os.lseek(fd, size - 1, os.SEEK_SET)
+                if os.read(fd, 1) != b"\n":  # an earlier write was cut off: end that line, then write ours
+                    data = b"\n" + data
+            view = memoryview(data)
+            while view:  # the system may write only part of it; the lock keeps other writers out meanwhile
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("The ledger row could not be written. Check the disk and the ledger file.")
+                view = view[written:]
         finally:
             os.close(fd)
 
@@ -127,36 +175,51 @@ class Ledger:
             finally:
                 os.close(fd)  # closing the file also releases the lock
 
-    def _read_rows(self) -> Tuple[List[dict], int]:
+    def _read_rows(self) -> Tuple[List[dict], List[int]]:
         rows: List[dict] = []
-        bad = 0
+        bad: List[int] = []
         try:
             handle = open(self.path, "rb")
         except FileNotFoundError:
             return rows, bad
         with handle:
-            for raw in handle:
+            for number, raw in enumerate(handle, start=1):
                 if not raw.strip():
                     continue
                 try:
                     row = json.loads(raw)
-                except ValueError:
-                    bad += 1
+                except (ValueError, RecursionError):
+                    bad.append(number)
                     continue
                 if _row_ok(row):
                     rows.append(row)
                 else:
-                    bad += 1
+                    bad.append(number)
         return rows, bad
 
-    def _totals(self, rows: List[dict], bad: int, project: str, job: str) -> Totals:
+    def _require_readable(self, bad: List[int]) -> None:
+        if not bad:
+            return
+        if self.skip_unreadable:
+            warnings.warn(f"spend_brakes: skipping {len(bad)} unreadable ledger line(s); their spend is NOT counted.")
+            return
+        shown = ", ".join(str(n) for n in bad[:5]) + (" and more" if len(bad) > 5 else "")
+        raise LedgerUnreadable(
+            f"Stopped: the ledger file {self.path} has {len(bad)} line(s) that cannot be read (line {shown}). "
+            "With an unreadable line the real spend is not known, so no paid call is allowed. "
+            "To repair it, ask the owner to make a copy of the file, then fix or remove only the damaged line(s). "
+            f"Skipping them is the owner's choice and not a repair: the money on those lines is then not counted "
+            f"(setting: {ENV_SKIP_UNREADABLE})."
+        )
+
+    def _totals(self, rows: List[dict], skipped: int, project: str, job: str) -> Totals:
         month = self._clock().strftime("%Y-%m")
         calls: Dict[str, dict] = {}
         for row in rows:
             call = calls.get(row["id"])
             if call is None:
-                call = calls[row["id"]] = {"month": str(row.get("t", ""))[:7], "project": row.get("project"),
-                                           "job": row.get("job"), "usd": row["usd"]}
+                call = calls[row["id"]] = {"month": row["t"][:7], "project": row["project"], "job": row["job"],
+                                           "usd": row["usd"]}
             if row["event"] == "settle":
                 call["usd"] = row["usd"]
         month_usd = project_usd = 0.0
@@ -168,11 +231,16 @@ class Ledger:
                 month_usd += call["usd"]
                 if call["project"] == project:
                     project_usd += call["usd"]
-        return Totals(round(month_usd, 6), round(project_usd, 6), job_calls, bad)
+        return Totals(round(month_usd, 6), round(project_usd, 6), job_calls, skipped)
 
 
 def _row_ok(row: object) -> bool:
-    if not isinstance(row, dict) or row.get("event") not in ("reserve", "settle") or not isinstance(row.get("id"), str):
+    """A row we can count with: every field the totals use must be there and make sense."""
+    if not isinstance(row, dict) or row.get("event") not in ("reserve", "settle"):
+        return False
+    if not isinstance(row.get("id"), str) or not isinstance(row.get("project"), str) or not isinstance(row.get("job"), str):
+        return False
+    if not isinstance(row.get("t"), str) or not _TIME_START.match(row["t"]):
         return False
     usd = row.get("usd")
     return isinstance(usd, (int, float)) and not isinstance(usd, bool) and math.isfinite(usd) and usd >= 0

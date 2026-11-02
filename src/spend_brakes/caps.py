@@ -45,9 +45,12 @@ def read_number(env: Mapping[str, str], name: str) -> Optional[float]:
     if not raw:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         raise ConfigError(f"{name}={raw!r} is not a number. Set it to a plain number such as 20.") from None
+    if not math.isfinite(value):  # nan, inf and a number too big to store (1e400) are not usable settings
+        raise ConfigError(f"{name}={raw!r} is not a usable number. Set it to a plain number such as 20.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -67,7 +70,7 @@ class Caps:
             raise HardCeilingExceeded(
                 f"max_calls_per_job={n} is above the hard ceiling of {HARD_MAX_CALLS_PER_JOB}. "
                 "The ceiling is written into the code on purpose, so no setting can raise it. "
-                "To change it, edit HARD_MAX_CALLS_PER_JOB in spend_brakes/caps.py and have that change reviewed."
+                "Only the owner can change it, in the code (HARD_MAX_CALLS_PER_JOB in spend_brakes/caps.py), with a review."
             )
 
     @classmethod
@@ -77,7 +80,7 @@ class Caps:
         monthly = read_number(env, ENV_MONTHLY)
         per_project = read_number(env, ENV_PROJECT_PREFIX + env_word(project))
         calls = read_number(env, ENV_JOB_CALLS)
-        if calls is not None and calls != int(calls):
+        if calls is not None and (not math.isfinite(calls) or calls != int(calls)):
             raise ConfigError(f"{ENV_JOB_CALLS}={calls} must be a whole number.")
         return cls(
             monthly_usd=DEFAULT_MONTHLY_CAP_USD if monthly is None else monthly,
