@@ -10,7 +10,7 @@ Python package: standard library only. TypeScript: one file, no dependencies. MI
 - A loop, a bad retry or an agent that does not stop can make thousands of calls before you look.
 - The bill comes later. These brakes stop the calls first.
 
-**Important:** if an agent can change the code, the environment, the stop file or the ledger, it can lift every brake. No setting can raise the two ceilings in the code, but an agent that can edit the code can change them, and a new job name gets past the job ceiling. So also keep a quota at the provider that the agent cannot change (see "An extra layer" below).
+**Important:** if an agent can change the code, the environment, the stop file or the ledger, it can turn off every brake. No setting can raise the two ceilings in the code, but an agent that can edit the code can change them, and a new job name avoids the job ceiling. So also keep a quota at the provider that the agent cannot change (see "An extra layer" below).
 
 ## The five brakes
 
@@ -28,13 +28,15 @@ Behind the brakes is the **ledger**: one append-only file (JSON Lines) that ever
 
 ### A job is one run
 
-The job limit counts every call ever recorded under the same project and job name. There is no time window. So **a job name must be new for each run of your script.** If you use the same name every day, the old calls still count, and one day the limit is reached for good. `job` is required: there is no default name.
+The job limit counts every call ever recorded under the same project and job name. There is no time window. So **a job name must be new for each run of your script.** If you use the same name every day, the old calls still count, and one day the limit is reached permanently. `job` is required: there is no default name.
 
 Use a run id. `run_id()` gives a new one each time:
 
 ```python
 job = "batch-" + run_id()      # for example batch-<date and time>-<six letters or digits>
 ```
+
+Build the job name **once, before the loop**, and use that same name for every call of the run. Do not call `run_id()` inside the loop. A new name for each call defeats the job limit, because every call then starts a new count at zero.
 
 ## Quick start (Python)
 
@@ -45,18 +47,21 @@ import os
 from spend_brakes import guarded_call, run_id
 from spend_brakes.httpjson import post_json
 
-result = guarded_call(
-    lambda: post_json(os.environ["IMAGE_API_URL"], {"prompt": "a red cube"}, key_env="IMAGE_API_KEY"),
-    estimate_usd=0.05,                # what one call may cost, worst case
-    project="blog-images",            # for the project cap
-    provider="image_api",             # for the provider switch: SPEND_IMAGE_API_ENABLED
-    job="batch-" + run_id(),          # NEW for every run of the script
-)
+job = "batch-" + run_id()             # ONCE for each run, before the loop
+
+for prompt in ["a red cube", "a blue cube"]:
+    result = guarded_call(
+        lambda: post_json(os.environ["IMAGE_API_URL"], {"prompt": prompt}, key_env="IMAGE_API_KEY"),
+        estimate_usd=0.05,            # what one call may cost, worst case
+        project="blog-images",        # for the project cap
+        provider="image_api",         # for the provider switch: SPEND_IMAGE_API_ENABLED
+        job=job,                      # the same name for every call of this run
+    )
 ```
 
 Your function must raise an error on an HTTP failure, or return an object with a `.status_code` or `.status`. `post_json` (included) does the first. If you use another HTTP client, call its "raise for status" method inside the function.
 
-`post_json` is careful with the key. It sends the key in a header only. It does not follow redirects (a 3xx answer is an `HttpStatusError`), because a redirect would send the key to a second address. It accepts only `https` URLs, and `http` only for the local machine (`localhost`, `127.0.0.1`, `::1`). It refuses `file:` and every other scheme, and URLs that contain a user name or password.
+`post_json` is careful with the key. It sends the key in a header only. It does not follow redirects (a 3xx answer is an `HttpStatusError`), because a redirect would send the key to a second address. It accepts only `https` URLs, and `http` only for the local machine (`localhost`, `127.0.0.1`, `::1`). It uses a proxy from the environment (`https_proxy`) for `https` only, so the connection to the API stays encrypted from end to end. It never uses a proxy for `http`, so a key is never sent to a proxy in clear text. The variables `http_proxy` and `all_proxy` are ignored. It refuses `file:` and every other scheme, and URLs that contain a user name or password.
 
 To see every brake without a network or a key, run `python examples/offline_demo.py`.
 
@@ -77,7 +82,7 @@ To repair it, the owner makes a copy of the file, finds the line numbers named i
 
 Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`), and a warning is shown each time.
 
-Writes are guarded against cut-off rows. A row is written with one call, and the rest is written if the system writes only part of it. If an earlier write was cut off, the next row starts on a new line, so the damaged line cannot swallow a good one.
+Writes are guarded against cut-off rows. A row is written with one call, and the rest is written if the system writes only part of it. If an earlier write was cut off, the next row starts on a new line, so the next row is never hidden inside the damaged line.
 
 ## Settings
 
@@ -113,22 +118,26 @@ A failed attempt keeps its estimate in the ledger, because a timeout or a server
 
 ## TypeScript (Node, serverless)
 
-`typescript/spend-brakes.ts` is one file. It has the same brakes, the same messages, the same setting names and the same ledger format, so a Node program and a Python script can share one ledger file.
+`typescript/spend-brakes.ts` is one file. It has the same brakes, the same messages, the same setting names and the same ledger format, so a Node program and a Python script may share one ledger file. They must not write to it at the same moment: Node takes no file lock.
 
 ```ts
 import { fileLedger, guardedCall, runId } from "./spend-brakes.js";
 
 const ledger = fileLedger(process.env.SPEND_BRAKES_LEDGER ?? "./spend-ledger.jsonl");
 
-const result = await guardedCall(() => fetch(url, { method: "POST", headers, body, redirect: "manual" }), {
-  estimateUsd: 0.05, project: "blog-images", provider: "image_api", job: `batch-${runId()}`, ledger,
-});
+const job = `batch-${runId()}`;       // ONCE for each run, before the loop
+
+for (const body of bodies) {
+  const result = await guardedCall(() => fetch(url, { method: "POST", headers, body, redirect: "manual" }), {
+    estimateUsd: 0.05, project: "blog-images", provider: "image_api", job, ledger,
+  });
+}
 ```
 
-`job` is required and must be new for each run (see "A job is one run"). `fetch` does not throw on HTTP errors, so the guard also reads `.status` from the returned response. Use `redirect: "manual"` so a redirect is not followed with your key attached; it then comes back as a 3xx response for you to handle.
+`job` is required. Build it once for each run, before the loop (see "A job is one run"). `fetch` does not throw on HTTP errors, so the guard also reads `.status` from the returned response. Use `redirect: "manual"` so a redirect is not followed with your key attached; it then comes back as a 3xx response for you to handle.
 
 - `memoryLedger()` keeps rows in memory (tests, one process).
-- `fileLedger(path)` writes the file (you give the path; there is no default). It is safe inside one process. Several processes at the same time can exceed the same cap by a small margin, because Node has no file lock without extra packages. It refuses to work with an unreadable line, like the Python ledger; `fileLedger(path, { skipUnreadable: true })` is the explicit opt-in.
+- `fileLedger(path)` writes the file (you give the path; there is no default). It is safe inside one process. Node takes no file lock (it has none without extra packages), so two processes that write at the same moment can exceed the same cap by a small margin, and this includes a Node program and a Python script that share the file. It refuses to work with an unreadable line, like the Python ledger; `fileLedger(path, { skipUnreadable: true })` is the explicit opt-in.
 - Serverless functions have no shared disk. Write a small `Ledger` over a database (two methods: `reserve` and `settle`). `reserve` must read the totals, run the check and write the estimate as one atomic step.
 - An `AbortError` (you cancelled the request) is never retried. A `TimeoutError` is.
 
@@ -138,17 +147,17 @@ const result = await guardedCall(() => fetch(url, { method: "POST", headers, bod
 - **A provider that bills without telling you.** The ledger holds your estimates, not the provider's invoice. If the provider charges for failed calls, changes prices, or adds fees, the ledger will not know. Compare the ledger with the real invoice from time to time.
 - **Costs outside your scripts.** Other tools, a web console, a colleague's script that does not use the brakes, and another machine with its own ledger file are not counted.
 - **Code that does not call the guard.** A brake works only on calls that go through `guarded_call`. Review new code for direct calls.
-- **An agent or a person who can change the brakes.** Anyone who can edit the code, the environment, the stop file or the ledger can lift every brake. This is a safety net for mistakes and runaway loops, not a security boundary. Keep a quota at the provider that they cannot change.
-- **A new job name for every call.** A loop that makes up a new `job` each time gets past the job limit and past the job ceiling. The monthly cap and the project cap still hold.
+- **An agent or a person who can change the brakes.** Anyone who can edit the code, the environment, the stop file or the ledger can turn off every brake. This is protection against mistakes and loops that do not stop, not a security boundary. Keep a quota at the provider that they cannot change.
+- **A new job name for each call.** A loop that makes up a new `job` for each call defeats the job limit: every call then starts a new count at zero, and the job ceiling is avoided too. Build the job name once, before the loop. The monthly cap and the project cap still hold.
 - **Windows and network file systems.** The ledger lock uses `fcntl` (macOS, Linux). On other systems it works inside one process only, and the tests that need it are skipped. `flock` may also not work on network file systems (NFS): do not share one ledger file between machines through NFS. Use a local file, or write a `Ledger` over a database.
 
 ## An extra layer: a tripwire at the billing level
 
-These brakes live in your own code. Keep a last line of defence outside your code, at the billing level:
+These brakes live in your own code. Keep a final protection outside your code, at the billing level:
 
 1. **Quotas at the provider.** Set a per-minute and per-day request limit on the API itself. It works in real time and stops a fast loop at once. Keep the key that changes this limit away from your scripts and agents.
 2. **A budget alert with an action.** Most cloud and API accounts can send a message when spend passes a limit. A budget alone only warns. Connect the alert to a small function that acts: it revokes the key, or turns off billing for the project.
-3. **Know the delay.** Usage reports can be hours late. The tripwire is the last line of defence for what the code brakes miss. It is not a replacement for them.
+3. **Know the delay.** Usage reports can be hours late. The tripwire is the final protection for what the code brakes miss. It is not a replacement for them.
 4. **Test it.** Set a very low budget, make one small call, and check that the function runs. Then set the real budget. Write down who turns the service back on, and how.
 
 ## Tests

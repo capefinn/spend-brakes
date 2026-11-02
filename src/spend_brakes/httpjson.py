@@ -2,8 +2,13 @@
 
 The key is read from an environment variable and sent in a header. It is never an argument, never in the URL,
 and it is removed from error text. It is also never sent to a second address: redirects are NOT followed (a 3xx
-answer becomes HttpStatusError), and only https is allowed (http only for the local machine). Use this helper,
-or use your own client: guarded_call only needs a function that raises on HTTP errors.
+answer becomes HttpStatusError), and only https is allowed (http only for the local machine).
+
+Proxies: a proxy from the environment is used for https only (the connection to the API stays encrypted from end to
+end). A proxy is NEVER used for http, so the key is never sent to a proxy in clear text. Variables such as
+http_proxy and all_proxy are ignored.
+
+Use this helper, or use your own client: guarded_call only needs a function that raises on HTTP errors.
 """
 from __future__ import annotations
 
@@ -34,10 +39,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _proxies() -> dict:
+    """Only the https proxy of the environment. Never an http proxy: it would see the key in clear text."""
+    return {name: url for name, url in urllib.request.getproxies().items() if name == "https"}
+
+
 def _opener() -> urllib.request.OpenerDirector:
     """Only plain http(s) handlers: no file:, ftp: or data: handler exists, even if a URL asks for one."""
     opener = urllib.request.OpenerDirector()
-    for handler in (urllib.request.ProxyHandler(), urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
+    for handler in (urllib.request.ProxyHandler(_proxies()), urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
                     urllib.request.UnknownHandler(), urllib.request.HTTPDefaultErrorHandler(),
                     urllib.request.HTTPErrorProcessor(), _NoRedirect()):
         opener.add_handler(handler)

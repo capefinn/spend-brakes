@@ -31,8 +31,13 @@ def env_word(name: str) -> str:
 
 
 def check_money(value: float, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise ConfigError(f"{label} must be a number that is zero or more (got {value!r}).")
+    try:
+        usable = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    except OverflowError:  # a whole number too big to be turned into a float
+        usable = False
+    if not usable:
+        text = repr(value) if len(repr(value)) <= 40 else repr(value)[:37] + "..."
+        raise ConfigError(f"{label} must be a number that is zero or more (got {text}).")
     return float(value)
 
 

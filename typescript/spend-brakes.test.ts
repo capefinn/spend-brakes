@@ -226,7 +226,7 @@ test("a job name is required and a run id makes a new one every time", async () 
   await assert.rejects(guardedCall(script("ok"), { ...base, ledger, caps, job: reused }), brake("job_limit"));
 });
 
-test("stop messages name the setting and do not teach how to lift the stop", async () => {
+test("stop messages name the setting and do not teach how to turn off the stop", async () => {
   const stops: BrakeError[] = [];
   const grab = async (p: Promise<unknown>) => { try { await p; } catch (e) { stops.push(e as BrakeError); } };
   await grab(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), caps: makeCaps({ monthlyUsd: 0.05 }) }));
@@ -283,7 +283,7 @@ test("skipping unreadable lines is an explicit choice (option or environment) an
   assert.equal(fn.calls, 2);
 });
 
-test("a row cut off by a crash is reported, and the next row is not swallowed by it", async () => {
+test("a row cut off by a crash is reported, and the next row is not hidden by it", async () => {
   const path = tmpFile(), fn = script("ok");
   writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 })) + '\n{"t":"cut');
   await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path), caps: makeCaps({ monthlyUsd: 100 }) }), brake("ledger_unreadable"));
@@ -300,4 +300,11 @@ test("a complete last row that only lacks its end-of-line mark is fine", async (
   writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 }))); // no final newline
   await guardedCall(fn, { ...base, ledger: fileLedger(path), caps: makeCaps({ monthlyUsd: 100 }) });
   assert.equal(readFileSync(path, "utf8").trim().split("\n").length, 3);
+});
+
+test("a huge whole number in the ledger is an unreadable line, not a crash or a free call", async () => {
+  const path = tmpFile(), fn = script("ok");
+  writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 })) + "\n" + `{"event":"reserve","id":"big","project":"a","job":"j","t":"${thisMonth()}-01T00:00:00Z","usd":1${"0".repeat(400)}}\n`);
+  await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path) }), brake("ledger_unreadable", /line 2/));
+  assert.equal(fn.calls, 0);
 });

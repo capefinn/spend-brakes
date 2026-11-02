@@ -15,7 +15,7 @@ so no call is allowed until the owner repairs the file. Skipping unreadable line
 
 Writes are guarded against cut-off rows: a row is written with one call (the rest is completed if the system writes
 only part of it), and if an earlier write left a line without its end-of-line mark, the next row starts on a new line,
-so a damaged line never swallows a good one. The damaged line itself is then reported as unreadable.
+so a damaged line never hides a good one. The damaged line itself is then reported as unreadable.
 """
 from __future__ import annotations
 
@@ -243,4 +243,7 @@ def _row_ok(row: object) -> bool:
     if not isinstance(row.get("t"), str) or not _TIME_START.match(row["t"]):
         return False
     usd = row.get("usd")
-    return isinstance(usd, (int, float)) and not isinstance(usd, bool) and math.isfinite(usd) and usd >= 0
+    try:
+        return isinstance(usd, (int, float)) and not isinstance(usd, bool) and math.isfinite(usd) and usd >= 0
+    except OverflowError:  # a whole number too big to be turned into a float: the row cannot be counted
+        return False

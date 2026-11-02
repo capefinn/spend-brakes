@@ -5,6 +5,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -202,3 +203,35 @@ def test_file_urls_are_refused_and_the_file_is_never_opened(tmp_path, monkeypatc
 ])
 def test_https_and_local_http_addresses_are_accepted(url):
     assert check_url(url) == url
+
+
+# ---- a proxy must never see the key in clear text ---------------------------------------------------------------
+
+@pytest.fixture
+def proxy_env(monkeypatch):
+    """No proxy settings from the real environment, so every test starts the same."""
+    import os
+    for name in list(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name)
+    return monkeypatch
+
+
+def test_a_local_http_call_goes_straight_to_the_server_even_when_http_proxy_is_set(server, other_server, proxy_env):
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        proxy_env.setenv(name, other_server["url"].rsplit("/", 1)[0])  # the fake "proxy" is the second server
+    server["plan"] = [(200, {"result": 1})]
+    assert post_json(server["url"], {}, key_env="TEST_API_KEY", env=ENV) == {"result": 1}
+    assert server["hits"] == 1 and server["seen"][0]["auth"] == f"Bearer {KEY}"
+    assert other_server["hits"] == 0 and other_server["seen"] == []  # the proxy never saw the call or the key
+
+
+def test_only_the_https_proxy_of_the_environment_is_used(proxy_env):
+    proxy_env.setenv("http_proxy", "http://proxy-one.invalid:3128")
+    proxy_env.setenv("all_proxy", "http://proxy-two.invalid:3128")
+    assert httpjson_module._proxies() == {}  # nothing for http, nothing from all_proxy
+    proxy_env.setenv("https_proxy", "http://proxy-three.invalid:3128")
+    assert httpjson_module._proxies() == {"https": "http://proxy-three.invalid:3128"}
+    handlers = [h for h in httpjson_module._opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert len(handlers) == 1 and handlers[0].proxies == {"https": "http://proxy-three.invalid:3128"}
+    assert not hasattr(handlers[0], "http_open")  # a ProxyHandler for http would have this method

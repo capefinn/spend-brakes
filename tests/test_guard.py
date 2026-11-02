@@ -226,7 +226,7 @@ def test_an_unknown_error_is_raised_unchanged_and_its_estimate_stays(call, ledge
     assert ledger.month_total() == 0.10
 
 
-def test_ctrl_c_is_not_swallowed(call, ledger):
+def test_ctrl_c_is_not_hidden(call, ledger):
     with pytest.raises(KeyboardInterrupt):
         call(Script(KeyboardInterrupt()))
     assert ledger.month_total() == 0.10  # the estimate was on record before the call
@@ -266,7 +266,7 @@ def test_run_ids_are_different_every_time_and_safe_inside_a_job_name():
     assert all(re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{6}", i) for i in ids)
 
 
-# ---- stop messages name the setting and do not teach how to lift the stop --------------------------------------
+# ---- stop messages name the setting and do not teach how to turn off the stop --------------------------------------
 
 def test_money_cap_messages_say_ask_the_owner_and_give_no_how_to(call):
     with pytest.raises(MonthlyCapReached) as monthly:
@@ -281,7 +281,7 @@ def test_money_cap_messages_say_ask_the_owner_and_give_no_how_to(call):
 
 
 @pytest.mark.parametrize("env", [{"SPEND_PANIC": "1"}, {"SPEND_IMAGE_API_ENABLED": "0"}, {"SPEND_PANIC": "maybe"}])
-def test_kill_switch_messages_do_not_teach_how_to_lift_the_stop(call, env):
+def test_kill_switch_messages_do_not_teach_how_to_turn_off_the_stop(call, env):
     with pytest.raises(BrakeError) as stop:
         call(Script("ok"), env=env)
     text = str(stop.value)

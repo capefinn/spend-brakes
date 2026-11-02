@@ -83,6 +83,9 @@ GARBAGE = [
     b"[1, 2, 3]\n",
     b"\xff\xfe not text \x00\n",
     b"[" * 100000 + b"\n",  # nesting so deep that the JSON reader gives up with another error type
+    # a whole number too big for a float: isfinite() raises OverflowError on it, and that must not escape
+    b'{"event":"reserve","id":"big","project":"a","job":"j","t":"1999-01-01T00:00:00+00:00","usd":1' + b"0" * 400 + b"}\n",
+    b'{"event":"settle","id":"big2","project":"a","job":"j","t":"1999-01-01T00:00:00+00:00","usd":-1' + b"0" * 400 + b"}\n",
 ]
 
 
@@ -139,7 +142,7 @@ def test_an_unreadable_skip_setting_is_refused(tmp_path):
         Ledger.from_env({"SPEND_BRAKES_SKIP_UNREADABLE": "perhaps"})
 
 
-def test_a_row_cut_off_by_a_crash_is_reported_and_does_not_swallow_the_next_row(tmp_path):
+def test_a_row_cut_off_by_a_crash_is_reported_and_does_not_hide_the_next_row(tmp_path):
     path = tmp_path / "l.jsonl"
     ledger = Ledger(path)
     reserve(ledger, 0.10)
@@ -238,3 +241,32 @@ def test_processes_append_at_the_same_time_without_losing_or_mixing_rows(tmp_pat
     assert len(lines) == 30
     assert all(json.loads(line)["event"] == "reserve" for line in lines)  # every line whole and valid
     assert Ledger(path).month_total() == 3.0
+
+
+def test_a_huge_whole_number_in_the_ledger_is_unreadable_not_a_crash(ledger, call):
+    reserve(ledger, 0.10)
+    huge = b'{"event":"reserve","id":"big","project":"a","job":"j","t":"1999-01-01T00:00:00+00:00","usd":1' + b"0" * 400 + b"}\n"
+    with open(ledger.path, "ab") as f:
+        f.write(huge)
+    fn = Script("ok")
+    with pytest.raises(LedgerUnreadable) as stop:  # not OverflowError
+        call(fn, caps=Caps(monthly_usd=100.0))
+    assert type(stop.value) is LedgerUnreadable and "line 2" in str(stop.value)
+    assert fn.calls == 0
+    assert ledger.unreadable_line_numbers() == [2]
+    lenient = Ledger(ledger.path, skip_unreadable=True)  # with the explicit opt-in the row is skipped, not counted
+    with pytest.warns(UserWarning):
+        assert lenient.month_total() == 0.10
+
+
+@pytest.mark.parametrize("huge", [10 ** 400, -(10 ** 400), 10 ** 309])
+def test_a_huge_whole_number_as_a_setting_or_an_estimate_is_a_config_error(ledger, call, huge):
+    with pytest.raises(ConfigError) as stop:
+        reserve(ledger, huge)
+    assert type(stop.value) is ConfigError and len(str(stop.value)) < 200  # the message does not print 400 digits
+    with pytest.raises(ConfigError):
+        Caps(monthly_usd=huge)
+    fn = Script("ok")
+    with pytest.raises(ConfigError):
+        call(fn, estimate_usd=huge)
+    assert fn.calls == 0 and not ledger.path.exists()

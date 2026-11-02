@@ -146,7 +146,7 @@ export function memoryLedger(now: () => Date = () => new Date()): Ledger & { row
  *  inside one process only; for several processes or servers, write a Ledger over a database transaction instead.
  *  A line that cannot be read means the real spend is not known, so by default every call is REFUSED (ledger_unreadable)
  *  until the owner repairs the file. Skipping such lines is an explicit choice: { skipUnreadable: true } or
- *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never swallowed. */
+ *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never hidden. */
 export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadable?: boolean } = {}): Ledger {
   const skip = opts.skipUnreadable ?? ["1", "true", "on", "yes"].includes((process.env.SPEND_BRAKES_SKIP_UNREADABLE ?? "").trim().toLowerCase());
   const read = (): Row[] => {
