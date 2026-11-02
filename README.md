@@ -10,7 +10,7 @@ Python package: standard library only. TypeScript: one file, no dependencies. MI
 - A loop, a bad retry or an agent that does not stop can make thousands of calls before you look.
 - The bill comes later. These brakes stop the calls first.
 
-**Important:** if an agent can change the code, the environment, the stop file or the ledger, it can turn off every brake. No setting can raise the two ceilings in the code, but an agent that can edit the code can change them, and a new job name avoids the job ceiling. So also keep a quota at the provider that the agent cannot change (see "An extra layer" below).
+**Important:** an agent that can change the code, the environment, the stop file or the ledger can turn off every brake. No setting can raise the two ceilings in the code. But an agent that can edit the code can change the ceilings. An agent can also use a new job name for every call. Each new name starts a new count at zero, so the job limit and its ceiling never stop that agent. So also keep a quota at the provider that the agent cannot change (see "An extra layer" below).
 
 ## The five brakes
 
@@ -18,11 +18,13 @@ Every brake is checked before every attempt, retries included. A stop is an erro
 
 | # | Brake | What it does | Setting |
 |---|-------|--------------|---------|
-| 1 | **Kill switch** | One master switch stops all paid calls. One switch per provider stops that provider only. A stop file also reaches programs that are already running. By default the stop file is a file named `STOP` in the same folder as the ledger file. | `SPEND_PANIC`, `SPEND_<PROVIDER>_ENABLED`, `SPEND_STOP_FILE` (only to use another file) |
+| 1 | **Kill switch** | One master switch stops all paid calls. One switch per provider stops that provider only. A stop file also reaches programs that are already running. By default the stop file is a file named `STOP` in the same folder as the ledger file. For the default ledger this is `~/.spend-brakes/STOP`, in Python and in TypeScript. | `SPEND_PANIC`, `SPEND_<PROVIDER>_ENABLED`, `SPEND_STOP_FILE` (only to use another file) |
 | 2 | **Monthly cap** | One money total for all your scripts together, taken from one shared ledger. | `SPEND_MONTHLY_CAP_USD` (default 20, an example number) |
 | 3 | **Project cap** | A smaller money limit for one project. | `SPEND_PROJECT_CAP_USD_<PROJECT>` |
 | 4 | **Job limit** | A limit on the number of calls in one job (default 6). A hard ceiling (20) is written in the code. No argument and no environment variable can raise it; only a change in the code can. | `SPEND_MAX_CALLS_PER_JOB`, up to the ceiling |
 | 5 | **Safe retries** | A refusal (401, 402, 403, 429) is never repeated. A server error (5xx) or a timeout is repeated a few times at most (default 1, ceiling 3). | `max_retries`, up to the ceiling of 3. It is an argument of `guarded_call`, not an environment setting. |
+
+The guard checks every cap again before every call, whatever it came from: an environment setting, a `Caps` object, or any other object. A cap that is not a number of zero or more is an error (`ConfigError`; in TypeScript a `BrakeError` with `.brake` set to `bad_setting`). A job limit above 20 is refused (`HardCeilingExceeded`; in TypeScript `hard_ceiling`). The same is true for `max_retries` above 3.
 
 Behind the brakes is the **ledger**: one append-only file (JSON Lines) that every script writes to. The estimated cost is written *before* the call. The real cost, or 0 if the provider refused the call, is written *after*. If a program crashes in the middle, the estimate stays and keeps counting.
 
@@ -36,7 +38,7 @@ Use a run id. `run_id()` gives a new one each time:
 job = "batch-" + run_id()      # for example batch-<date and time>-<six letters or digits>
 ```
 
-Build the job name **once, before the loop**, and use that same name for every call of the run. Do not call `run_id()` inside the loop. A new name for each call defeats the job limit, because every call then starts a new count at zero.
+Build the job name **once, before the loop**, and use that same name for every call of the run. Do not call `run_id()` inside the loop. If every call has a new name, every call starts a new count at zero, and the job limit never stops the loop.
 
 Every attempt counts for the job limit, retries included. A job limit of 1 therefore leaves no room for a retry: the second attempt is stopped with `JobLimitReached`. Set the limit to the number of calls you plan, plus the retries you accept.
 
@@ -79,7 +81,14 @@ result = guarded_call(call_api, estimate_usd=0.05, project="blog-images", provid
 
 In TypeScript no helper is needed: the guard reads `.status` from what your function returns, and from an error it throws.
 
-`post_json` is careful with the key. It sends the key in a header only. It does not follow redirects (a 3xx answer is an `HttpStatusError`), because a redirect would send the key to a second address. It accepts only `https` URLs, and `http` only for the local machine (`localhost`, `127.0.0.1`, `::1`). It uses a proxy from the environment (`https_proxy`) for `https` only, so the connection to the API stays encrypted from end to end. It never uses a proxy for `http`, so a key is never sent to a proxy in clear text. The variables `http_proxy` and `all_proxy` are ignored. It refuses `file:` and every other scheme, and URLs that contain a user name or password.
+`post_json` is careful with the key:
+
+- It sends the key in a header only.
+- It does not follow redirects. A 3xx answer is an `HttpStatusError`, because a redirect would send the key to a second address.
+- It accepts only `https` URLs. It accepts `http` only for the local machine (`localhost`, `127.0.0.1`, `::1`).
+- It refuses `file:` and every other scheme. It refuses URLs that contain a user name or a password.
+- It uses a proxy from the environment (`https_proxy`) for `https` only. The connection to the API then stays encrypted from end to end.
+- It never uses a proxy for `http`, so a key is never sent to a proxy without encryption. The variables `http_proxy` and `all_proxy` are ignored.
 
 If the key is not in `os.environ` (for example you read it from a secrets store), give `post_json` an `env=` mapping. It reads `key_env` from that mapping instead of `os.environ`:
 
@@ -100,9 +109,9 @@ which would exceed the cap of $20.00. Ask the owner to raise it (setting: SPEND_
 
 Errors you can catch: `BrakeError` (all stops) and its types `KillSwitchOn`, `MonthlyCapReached`, `ProjectCapReached`, `JobLimitReached`, `HardCeilingExceeded`, `NotRetried`, `RetriesExhausted`, `LedgerUnreadable`. Each has `.brake` with the short name. A bad setting (for example a cap that is not a number, or `nan`) raises `ConfigError`. It is never ignored.
 
-## Check without calling (for a dry run)
+## Check without calling (a test run that spends nothing)
 
-`check_call` answers one question: would `guarded_call` allow this call now? It takes the same keyword arguments as `guarded_call`, without the function. It runs the same brakes and raises the same `BrakeError`, with the same message. It writes nothing to the ledger, so it never uses up the job limit. Import it with `from spend_brakes import check_call`.
+A test run that shows what would happen, and spends nothing, is often called a "dry run". `check_call` is made for it. It answers one question: would `guarded_call` allow this call now? It takes the same keyword arguments as `guarded_call`, without the function. It runs the same brakes and raises the same `BrakeError`, with the same message. It writes nothing to the ledger, so it never uses up the job limit. Import it with `from spend_brakes import check_call`.
 
 ```python
 check_call(estimate_usd=0.05, project="blog-images", provider="image_api", job=job)   # raises BrakeError if a real call would stop
@@ -124,7 +133,7 @@ If any line in the ledger cannot be read, the real spend is not known. All calls
 
 To repair it, the owner makes a copy of the file, finds the line numbers named in the error, and fixes or removes only those lines. `Ledger.unreadable_line_numbers()` lists them, and `Ledger.rows()` still shows the readable rows.
 
-Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`), and a warning is shown each time.
+Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`), and a warning is shown once per program.
 
 Writes are guarded against cut-off rows. A row is written with one call, and the rest is written if the system writes only part of it. If an earlier write was cut off, the next row starts on a new line, so the next row is never hidden inside the damaged line.
 
@@ -133,7 +142,7 @@ Writes are guarded against cut-off rows. A row is written with one call, and the
 Put these in your shell profile or your deploy settings. Every script then sees the same numbers.
 
 ```bash
-export SPEND_BRAKES_LEDGER=/path/to/spend-ledger.jsonl   # one file for all scripts (default: a folder named .spend-brakes in your home folder)
+export SPEND_BRAKES_LEDGER=/path/to/spend-ledger.jsonl   # one file for all scripts. The value is a file path. Default: .spend-brakes/ledger.jsonl in your home folder
 export SPEND_MONTHLY_CAP_USD=20
 export SPEND_PROJECT_CAP_USD_BLOG_IMAGES=5               # the project name "blog-images" becomes BLOG_IMAGES
 export SPEND_MAX_CALLS_PER_JOB=6                         # 20 is the highest value that works
@@ -151,10 +160,16 @@ Notes:
 - Money can be in any currency. The names say `usd`, but use one currency everywhere.
 - Months are UTC calendar months.
 - An environment variable changes only programs that start after the change. To stop a program that is already running, create the stop file.
-- **The stop file.** By default it is a file named `STOP` in the same folder as the ledger file. For the default ledger, create it with `mkdir -p ~/.spend-brakes && touch ~/.spend-brakes/STOP`. While the file exists, every paid call stops, also in programs that are already running. Delete the file to go on. `SPEND_STOP_FILE` replaces the default: when it is set, only that file counts. A ledger that is not a file has no default stop file (the TypeScript `memoryLedger()`, or a ledger you write over a database).
+- **The stop file.**
+  - By default it is a file named `STOP` in the same folder as the ledger file. For the default ledger, create it with `mkdir -p ~/.spend-brakes && touch ~/.spend-brakes/STOP`.
+  - While the file exists, every paid call stops. This includes programs that are already running.
+  - Delete the file to allow paid calls again.
+  - `SPEND_STOP_FILE` replaces the default. When it is set, only that file counts.
+  - Some ledgers are not files: the TypeScript `memoryLedger()`, or a ledger you write over a database. They have no default stop file.
 - On macOS and Linux, the Python ledger creates a `.lock` file next to the ledger file (for example `ledger.jsonl.lock`) when it first writes. It is normal, and it may stay.
 - The ledger knows only the spend that was recorded through it. Spend from before you started, or from other tools, is not in it. In the first month, set `SPEND_MONTHLY_CAP_USD` lower than your real monthly limit, to allow for that earlier spend.
-- A switch value that cannot be read (for example `disabled`) counts as STOP, not as GO. A number that cannot be read (`abc`, `nan`, `inf`) is a `ConfigError`.
+- A switch value that cannot be read (for example `disabled`) counts as STOP, not as GO. A number that cannot be read (`abc`, `nan`, `inf`) is a `ConfigError`. `SPEND_BRAKES_SKIP_UNREADABLE` accepts only `1`, `true`, `on`, `yes` and `0`, `false`, `off`, `no`. Any other value is an error, in Python and in TypeScript.
+- **The project name is cleaned up.** Only the letters A to Z and the digits 0 to 9 count. Every other sign, or group of signs, becomes one `_`, and the result is written in capital letters. So `blog-images`, `blog images`, `Blog_Images` and `BLOG-IMAGES` are all `BLOG_IMAGES`. The setting name uses this cleaned name. The project total and the job count in the ledger use it too, so these four spellings share one project cap and one job count. The rows in the ledger keep the name exactly as you wrote it. Letters such as `ä` and `ö` do not count: `Kuvat äänet` becomes `KUVAT_NET`. Use letters from A to Z in project names. A name with no such letters and no digits (for example one in Japanese) cannot make a setting name. It is counted under its exact text.
 - The API key goes into an environment variable (a name you choose, for example `IMAGE_API_KEY`). It is never a command argument, never in the URL, and it is removed from error text. Do not write the key in a shell command: other users of the machine can see command lines, and your shell history keeps them. If you must use `curl`, give the header through `curl -K -` and standard input.
 
 ## How to choose the estimate
@@ -165,12 +180,12 @@ A failed attempt keeps its estimate in the ledger, because a timeout or a server
 
 ## TypeScript (Node, serverless)
 
-`typescript/spend-brakes.ts` is one file. It has the same brakes, the same messages, the same setting names and the same ledger format, so a Node program and a Python script may share one ledger file. They must not write to it at the same moment: Node takes no file lock.
+`typescript/spend-brakes.ts` is one file. It has the same brakes, the same setting names and the same ledger format. Its messages say the same thing as the Python messages; small differences in formatting are possible. So a Node program and a Python script may share one ledger file, and one stop file. They must not write to the ledger at the same moment: Node takes no file lock.
 
 ```ts
-import { fileLedger, guardedCall, runId } from "./spend-brakes.js";
+import { defaultLedgerPath, fileLedger, guardedCall, runId } from "./spend-brakes.js";
 
-const ledger = fileLedger(process.env.SPEND_BRAKES_LEDGER ?? "./spend-ledger.jsonl");
+const ledger = fileLedger(defaultLedgerPath());   // SPEND_BRAKES_LEDGER, or else ~/.spend-brakes/ledger.jsonl (the same as Python)
 
 const job = `batch-${runId()}`;       // ONCE for each run, before the loop
 
@@ -184,8 +199,15 @@ for (const body of bodies) {
 `job` is required. Build it once for each run, before the loop (see "A job is one run"). `fetch` does not throw on HTTP errors, so the guard also reads `.status` from the returned response. Use `redirect: "manual"` so a redirect is not followed with your key attached; it then comes back as a 3xx response for you to handle.
 
 - `memoryLedger()` keeps rows in memory (tests, one process). It has no default stop file.
-- `fileLedger(path)` writes the file (you give the path; there is no default). It is safe inside one process. Node takes no file lock (it has none without extra packages), so two processes that write at the same moment can exceed the same cap by a small margin, and this includes a Node program and a Python script that share the file. It refuses to work with an unreadable line, like the Python ledger; `fileLedger(path, { skipUnreadable: true })` is the explicit opt-in. A file named `STOP` in the same folder is its default stop file.
-- Serverless functions have no shared disk. Write a small `Ledger` over a database (three methods: `reserve`, `settle` and `preview`). `reserve` must read the totals, run the check and write the estimate as one atomic step. `preview` does the same without the write: it reads the totals and runs the check. `checkCall` uses it. A ledger may also set `stopFile`, a path that is its default stop file.
+- `fileLedger(path)` writes the file. You give the path. `defaultLedgerPath()` gives the same default as Python: `SPEND_BRAKES_LEDGER`, or else `~/.spend-brakes/ledger.jsonl`.
+- `fileLedger` is safe inside one process. Node has no file lock without extra packages. Two processes that write at the same moment can pass the same cap by a small amount. This includes a Node program and a Python script that share the file.
+- `fileLedger` refuses to work with an unreadable line, like the Python ledger. `fileLedger(path, { skipUnreadable: true })` is the explicit choice to skip such lines. It then shows a warning with `console.warn`, once per program.
+- A file named `STOP` in the same folder is the default stop file. For the default ledger it is `~/.spend-brakes/STOP`, the same file the Python package uses.
+- Serverless functions have no shared disk. Write a small `Ledger` over a database. It has three methods: `reserve`, `settle` and `preview`.
+  - `reserve` must read the totals, run the check and write the estimate as one atomic step.
+  - `preview` does the same without the write. `checkCall` uses it.
+  - Count the project total and the job count by `projectKey(project)`, not by the exact text of the project name.
+  - A ledger may also set `stopFile`, a path that is its default stop file.
 - An `AbortError` (you cancelled the request) is never retried. A `TimeoutError` is.
 
 ## What it does NOT protect against
@@ -195,16 +217,16 @@ for (const body of bodies) {
 - **Costs outside your scripts.** Other tools, a web console, a colleague's script that does not use the brakes, and another machine with its own ledger file are not counted.
 - **Code that does not call the guard.** A brake works only on calls that go through `guarded_call`. Review new code for direct calls.
 - **An agent or a person who can change the brakes.** Anyone who can edit the code, the environment, the stop file or the ledger can turn off every brake. This is protection against mistakes and loops that do not stop, not a security boundary. Keep a quota at the provider that they cannot change.
-- **A new job name for each call.** A loop that makes up a new `job` for each call defeats the job limit: every call then starts a new count at zero, and the job ceiling is avoided too. Build the job name once, before the loop. The monthly cap and the project cap still hold.
+- **A new job name for each call.** A loop that makes up a new `job` name for each call is not stopped by the job limit. Every call starts a new count at zero. The hard ceiling of 20 calls per job does not help either. Build the job name once, before the loop. The monthly cap and the project cap still work.
 - **Windows and network file systems.** The ledger lock uses `fcntl` (macOS, Linux). On other systems it works inside one process only, and the tests that need it are skipped. `flock` may also not work on network file systems (NFS): do not share one ledger file between machines through NFS. Use a local file, or write a `Ledger` over a database.
 
-## An extra layer: a tripwire at the billing level
+## An extra layer: a stop at the billing level
 
 These brakes live in your own code. Keep a final protection outside your code, at the billing level:
 
 1. **Quotas at the provider.** Set a per-minute and per-day request limit on the API itself. It works in real time and stops a fast loop at once. Keep the key that changes this limit away from your scripts and agents.
 2. **A budget alert with an action.** Most cloud and API accounts can send a message when spend passes a limit. A budget alone only warns. Connect the alert to a small function that acts: it revokes the key, or turns off billing for the project.
-3. **Know the delay.** Usage reports can be hours late. The tripwire is the final protection for what the code brakes miss. It is not a replacement for them.
+3. **Know the delay.** Usage reports can be hours late. The stop at the billing level is the last protection for what the brakes in your code miss. It does not replace them.
 4. **Test it.** Set a very low budget, make one small call, and check that the function runs. Then set the real budget. Write down who turns the service back on, and how.
 
 ## Tests
