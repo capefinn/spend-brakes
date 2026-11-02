@@ -8,8 +8,8 @@ import urllib.error
 import warnings
 from typing import Any, Callable, Mapping, Optional, TypeVar
 
-from .caps import (ENV_JOB_CALLS, ENV_MONTHLY, ENV_PROJECT_PREFIX, HARD_MAX_RETRIES, Caps, check_estimate,
-                   check_money, env_word)
+from .caps import (ENV_JOB_CALLS, ENV_MONTHLY, ENV_PROJECT_PREFIX, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, Caps,
+                   check_caps, check_estimate, check_money, env_word)
 from .errors import (ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached, NotRetried,
                      ProjectCapReached, RetriesExhausted)
 from .killswitch import check_kill_switch
@@ -69,14 +69,17 @@ def _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries, re
             "code on purpose, so no setting can raise it. Only the owner can change it, in the code "
             "(HARD_MAX_RETRIES in spend_brakes/caps.py), with a review."
         )
-    caps = caps if caps is not None else Caps.from_env(project, env)
+    # Caps from any source are checked here, so a Caps made by a trick, or any other object, cannot switch a cap off.
+    # The values are read once; `check` uses the checked copy only.
+    caps = check_caps(caps if caps is not None else Caps.from_env(project, env))
+    job_limit = min(caps.max_calls_per_job, HARD_MAX_CALLS_PER_JOB)  # the last guard: never above the ceiling in the code
     ledger = ledger if ledger is not None else Ledger.from_env(env)
 
     def check(totals: Totals) -> None:
-        if totals.job_calls >= caps.max_calls_per_job:
+        if totals.job_calls >= job_limit:
             raise JobLimitReached(
                 f"Stopped by the job limit: job {job!r} already has {totals.job_calls} recorded calls (limit "
-                f"{caps.max_calls_per_job}, refused calls count too). Look at why the job needs more calls. "
+                f"{job_limit}, refused calls count too). Look at why the job needs more calls. "
                 f"Ask the owner if the limit should change (setting: {ENV_JOB_CALLS}); the hard ceiling in the code "
                 "cannot be raised by a setting."
             )

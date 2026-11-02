@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 
 import spend_brakes.caps as caps_module
-from spend_brakes import HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, Caps, ConfigError, HardCeilingExceeded
+from spend_brakes import HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, Caps, ConfigError, HardCeilingExceeded, project_key
 
 
 def test_defaults_are_small_example_numbers():
@@ -71,3 +71,16 @@ def test_a_non_finite_job_limit_is_a_config_error_not_another_error_type(value):
 def test_a_huge_but_finite_job_limit_is_stopped_by_the_ceiling():
     with pytest.raises(HardCeilingExceeded):
         Caps.from_env("p", {"SPEND_MAX_CALLS_PER_JOB": "1e300"})
+
+
+@pytest.mark.parametrize("name", ["blog-images", "blog images", "Blog_Images", "BLOG-IMAGES", "  blog -- images  ", "__blog.images__"])
+def test_every_spelling_of_a_project_name_has_the_key_of_its_setting_name(name):
+    assert project_key(name) == "BLOG_IMAGES"
+    assert caps_module.ENV_PROJECT_PREFIX + project_key(name) == "SPEND_PROJECT_CAP_USD_BLOG_IMAGES"
+
+
+def test_different_names_have_different_keys_and_a_name_without_letters_keeps_its_text():
+    assert project_key("blog-images-2") != project_key("blog-images") != project_key("blog")
+    assert project_key("---") == "---" and project_key("ブログ") == "ブログ" and project_key("ニュース") != project_key("ブログ")
+    assert project_key("") == ""  # never raises
+    assert project_key("Kuvat äänet") == project_key("kuvat-äänet") == "KUVAT_NET"

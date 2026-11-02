@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
-import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkCall, checkKillSwitch, fileLedger, guardedCall, makeCaps, memoryLedger, runId } from "./spend-brakes.js";
+import { mock, test } from "node:test";
+import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkCall, checkKillSwitch, defaultLedgerPath, fileLedger, guardedCall, makeCaps, memoryLedger, projectKey, runId } from "./spend-brakes.js";
 import type { Ledger } from "./spend-brakes.js";
+
+// The warning about skipped ledger lines is shown once per program. Its own test runs in a separate process (see the end
+// of this file); here it is kept out of the test output.
+mock.method(console, "warn", () => {});
 
 const noSleep = async () => {};
 const base = { estimateUsd: 0.1, project: "proj-a", provider: "image_api", job: "job-1", env: {}, sleep: noSleep, caps: makeCaps({ monthlyUsd: 100 }) };
@@ -425,4 +430,221 @@ test("checkCall takes the same options as guardedCall and reads the environment 
   await assert.rejects(checkCall(open), brake("monthly_cap", /SPEND_MONTHLY_CAP_USD/));
   env.SPEND_MONTHLY_CAP_USD = "5";
   await checkCall(open);
+});
+
+
+// ---- caps and retries are checked inside the guard, whatever object they come from ------------------------------
+
+test("the attack: a plain caps object with maxCallsPerJob 500 lets no call through (guardedCall and checkCall)", async () => {
+  const ledger = memoryLedger(), fn = script("ok");
+  const caps = { monthlyUsd: 20, maxCallsPerJob: 500 }; // not made by makeCaps()
+  let through = 0;
+  for (let i = 0; i < 500; i++) {
+    try { await guardedCall(fn, { ...base, ledger, caps, estimateUsd: 0 }); through++; } catch (e) { assert.ok(brake("hard_ceiling", /HARD_MAX_CALLS_PER_JOB/)(e)); }
+  }
+  assert.equal(through, 0);
+  assert.equal(fn.calls, 0);
+  assert.equal(ledger.rows.length, 0);
+  await assert.rejects(checkCall({ ...base, ledger, caps }), brake("hard_ceiling"));
+});
+
+test("a plain caps object at exactly the ceiling works, and the call after the ceiling is stopped", async () => {
+  const ledger = memoryLedger(), fn = script("ok"), caps = { monthlyUsd: 100, maxCallsPerJob: HARD_MAX_CALLS_PER_JOB };
+  for (let i = 0; i < HARD_MAX_CALLS_PER_JOB; i++) await guardedCall(fn, { ...base, ledger, caps });
+  await assert.rejects(guardedCall(fn, { ...base, ledger, caps }), brake("job_limit", /limit 20,/));
+  await assert.rejects(guardedCall(fn, { ...base, ledger, caps: { ...caps, maxCallsPerJob: HARD_MAX_CALLS_PER_JOB + 1 } }), brake("hard_ceiling"));
+  assert.equal(fn.calls, HARD_MAX_CALLS_PER_JOB);
+});
+
+const badCaps: Array<[string, unknown]> = [
+  ["NaN monthly cap", { monthlyUsd: Number.NaN, maxCallsPerJob: 3 }],
+  ["Infinity monthly cap", { monthlyUsd: Infinity, maxCallsPerJob: 3 }],
+  ["negative monthly cap", { monthlyUsd: -0.01, maxCallsPerJob: 3 }],
+  ["monthly cap as text", { monthlyUsd: "20", maxCallsPerJob: 3 }],
+  ["monthly cap null", { monthlyUsd: null, maxCallsPerJob: 3 }],
+  ["monthly cap missing", { maxCallsPerJob: 3 }],
+  ["NaN project cap", { monthlyUsd: 20, projectUsd: Number.NaN, maxCallsPerJob: 3 }],
+  ["Infinity project cap", { monthlyUsd: 20, projectUsd: Infinity, maxCallsPerJob: 3 }],
+  ["negative project cap", { monthlyUsd: 20, projectUsd: -1, maxCallsPerJob: 3 }],
+  ["project cap as text", { monthlyUsd: 20, projectUsd: "5", maxCallsPerJob: 3 }],
+  ["project cap null", { monthlyUsd: 20, projectUsd: null, maxCallsPerJob: 3 }],
+  ["NaN job limit", { monthlyUsd: 20, maxCallsPerJob: Number.NaN }],
+  ["Infinity job limit", { monthlyUsd: 20, maxCallsPerJob: Infinity }],
+  ["job limit 0", { monthlyUsd: 20, maxCallsPerJob: 0 }],
+  ["negative job limit", { monthlyUsd: 20, maxCallsPerJob: -3 }],
+  ["fractional job limit", { monthlyUsd: 20, maxCallsPerJob: 2.5 }],
+  ["job limit as text", { monthlyUsd: 20, maxCallsPerJob: "3" }],
+  ["job limit null", { monthlyUsd: 20, maxCallsPerJob: null }],
+  ["job limit missing", { monthlyUsd: 20 }],
+  ["empty object", {}],
+  ["not an object: text", "caps"],
+  ["not an object: number", 20],
+  ["not an object: true", true],
+];
+
+test("a cap that is not a finite number of zero or more is a bad_setting error in guardedCall and checkCall, and nothing is written", async () => {
+  for (const [name, caps] of badCaps) {
+    const ledger = memoryLedger(), fn = script("ok");
+    await assert.rejects(guardedCall(fn, { ...base, ledger, caps: caps as any }), brake("bad_setting"), name);
+    await assert.rejects(checkCall({ ...base, ledger, caps: caps as any }), brake("bad_setting"), name);
+    assert.equal(fn.calls, 0, name);
+    assert.equal(ledger.rows.length, 0, name);
+  }
+});
+
+test("a NaN cap no longer switches the cap off", async () => {
+  const ledger = memoryLedger(), fn = script("ok");
+  await assert.rejects(guardedCall(fn, { ...base, ledger, estimateUsd: 1000, caps: { monthlyUsd: Number.NaN, maxCallsPerJob: 3 } }), brake("bad_setting", /monthlyUsd/));
+  await assert.rejects(guardedCall(fn, { ...base, ledger, estimateUsd: 1000, caps: { monthlyUsd: 100, projectUsd: Number.NaN, maxCallsPerJob: 3 } }), brake("bad_setting", /projectUsd/));
+  assert.equal(fn.calls, 0);
+});
+
+test("a plain caps object with good numbers is accepted, and the project cap in it works", async () => {
+  const ledger = memoryLedger(), fn = script("ok"), caps = { monthlyUsd: 1, projectUsd: 0.1, maxCallsPerJob: 2 };
+  await guardedCall(fn, { ...base, ledger, caps });
+  await assert.rejects(guardedCall(fn, { ...base, ledger, caps }), brake("project_cap"));
+});
+
+test("the cap numbers are read once, so a getter cannot give a higher limit later", async () => {
+  let reads = 0;
+  const shifty = { monthlyUsd: 100, get maxCallsPerJob() { reads++; return reads === 1 ? 3 : 500; } };
+  const flaky = script(httpError(503));
+  await assert.rejects(guardedCall(flaky, { ...base, ledger: memoryLedger(), caps: shifty, maxRetries: HARD_MAX_RETRIES, retryDelayMs: 0 }), brake("job_limit"));
+  assert.equal(flaky.calls, 3);
+  assert.equal(reads, 1);
+});
+
+test("maxRetries and retryDelayMs follow the same rules in guardedCall and checkCall", async () => {
+  for (const bad of [Number.NaN, Infinity, 1.5, null, "2", true, -1]) {
+    const fn = script("ok");
+    await assert.rejects(guardedCall(fn, { ...base, ledger: memoryLedger(), maxRetries: bad as any }), brake("bad_setting"), String(bad));
+    await assert.rejects(checkCall({ ...base, ledger: memoryLedger(), maxRetries: bad as any }), brake("bad_setting"), String(bad));
+    assert.equal(fn.calls, 0);
+  }
+  for (const tooMany of [HARD_MAX_RETRIES + 1, 50, 1e9]) {
+    await assert.rejects(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), maxRetries: tooMany }), brake("hard_ceiling"));
+    await assert.rejects(checkCall({ ...base, ledger: memoryLedger(), maxRetries: tooMany }), brake("hard_ceiling"));
+  }
+  for (const bad of [Number.NaN, Infinity, -1, "5", null]) {
+    const fn = script("ok");
+    await assert.rejects(guardedCall(fn, { ...base, ledger: memoryLedger(), retryDelayMs: bad as any }), brake("bad_setting", /retryDelayMs/), String(bad));
+    await assert.rejects(checkCall({ ...base, ledger: memoryLedger(), retryDelayMs: bad as any }), brake("bad_setting", /retryDelayMs/), String(bad));
+    assert.equal(fn.calls, 0);
+  }
+  await guardedCall(script("ok"), { ...base, ledger: memoryLedger(), maxRetries: HARD_MAX_RETRIES, retryDelayMs: 0 });
+});
+
+// ---- one project, many spellings -----------------------------------------------------------------------------------
+
+const SPELLINGS = ["blog-images", "blog images", "Blog_Images", "BLOG-IMAGES"]; // all give SPEND_PROJECT_CAP_USD_BLOG_IMAGES
+
+test("the project cap is one cap for every spelling of the project name, and rows keep the original text", async () => {
+  const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.4 });
+  for (const project of SPELLINGS) await guardedCall(script("ok"), { ...base, ledger, caps, project }); // four calls of $0.10: exactly the cap
+  for (const project of SPELLINGS) await assert.rejects(guardedCall(script("ok"), { ...base, ledger, caps, project }), brake("project_cap", /SPEND_PROJECT_CAP_USD_BLOG_IMAGES/), project);
+  assert.deepEqual(ledger.rows.filter((r) => r.event === "reserve").map((r) => r.project), SPELLINGS);
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "blog-images-2" }); // another name is another project
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "blog" });
+});
+
+test("the job limit counts every spelling of the project name together", async () => {
+  const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, maxCallsPerJob: 4 }), fn = script("ok");
+  for (const project of SPELLINGS) await guardedCall(fn, { ...base, ledger, caps, project, job: "run-1" });
+  for (const project of SPELLINGS) await assert.rejects(guardedCall(fn, { ...base, ledger, caps, project, job: "run-1" }), brake("job_limit"), project);
+  await guardedCall(fn, { ...base, ledger, caps, project: "blog-images", job: "run-2" }); // another job
+  await guardedCall(fn, { ...base, ledger, caps, project: "other-project", job: "run-1" }); // another project
+  assert.equal(fn.calls, 6);
+});
+
+test("a row written under one spelling (for example by the Python package) counts for the other spellings in a file ledger", async () => {
+  const path = tmpFile(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.5 });
+  writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { project: "Blog_Images", usd: 0.45, job: "j-old" })) + "\n");
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger: fileLedger(path), caps, project: "blog-images", estimateUsd: 0.1 }), brake("project_cap"));
+  await guardedCall(script("ok"), { ...base, ledger: fileLedger(path), caps, project: "blog-images", estimateUsd: 0.05 });
+});
+
+test("projectKey: the key of a setting name; Finnish letters are cleaned like the setting name; a name without letters keeps its text", () => {
+  for (const name of [...SPELLINGS, "  blog -- images  ", "__blog.images__"]) assert.equal(projectKey(name), "BLOG_IMAGES", name);
+  assert.notEqual(projectKey("blog-images-2"), projectKey("blog-images"));
+  assert.equal(projectKey("Kuvat äänet"), "KUVAT_NET");
+  assert.equal(projectKey("kuvat-äänet"), projectKey("Kuvat äänet"));
+  assert.equal(projectKey("---"), "---");
+  assert.equal(projectKey("ブログ"), "ブログ");
+  assert.notEqual(projectKey("ニュース"), projectKey("ブログ"));
+  assert.equal(projectKey(""), ""); // never throws
+});
+
+test("Finnish and non-Latin project names are counted without errors", async () => {
+  const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.2 });
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "Kuvat äänet" });
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "kuvat-äänet" });
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "ブログ" }); // no A-Z or 0-9: counted under its exact text
+  await guardedCall(script("ok"), { ...base, ledger, caps, project: "ニュース" }); // another such name is another project
+});
+
+// ---- the default ledger file and the default stop file are the same as in Python ------------------------------
+
+test("defaultLedgerPath: SPEND_BRAKES_LEDGER, else ~/.spend-brakes/ledger.jsonl (the same rule as Python)", () => {
+  assert.equal(defaultLedgerPath({ SPEND_BRAKES_LEDGER: "/some/where/l.jsonl" }), "/some/where/l.jsonl");
+  assert.equal(defaultLedgerPath({ SPEND_BRAKES_LEDGER: "  /some/where/l.jsonl  " }), "/some/where/l.jsonl");
+  const standard = join(homedir(), ".spend-brakes", "ledger.jsonl");
+  for (const env of [{}, { SPEND_BRAKES_LEDGER: "" }, { SPEND_BRAKES_LEDGER: "   " }, { SPEND_BRAKES_LEDGER: undefined }]) assert.equal(defaultLedgerPath(env), standard);
+  const saved = process.env.SPEND_BRAKES_LEDGER;
+  try {
+    process.env.SPEND_BRAKES_LEDGER = "/from/process/env.jsonl";
+    assert.equal(defaultLedgerPath(), "/from/process/env.jsonl");
+    delete process.env.SPEND_BRAKES_LEDGER;
+    assert.equal(defaultLedgerPath(), standard);
+  } finally { if (saved === undefined) delete process.env.SPEND_BRAKES_LEDGER; else process.env.SPEND_BRAKES_LEDGER = saved; }
+});
+
+test("the default stop file of the default ledger is ~/.spend-brakes/STOP, the same file the Python package uses", () => {
+  assert.equal(fileLedger(defaultLedgerPath({})).stopFile, join(homedir(), ".spend-brakes", "STOP"));
+  assert.equal(fileLedger(defaultLedgerPath({ SPEND_BRAKES_LEDGER: "/data/x/l.jsonl" })).stopFile, join("/data/x", "STOP"));
+});
+
+// ---- SPEND_BRAKES_SKIP_UNREADABLE: unknown values are an error, like in Python ----------------------------------
+
+test("an unknown SPEND_BRAKES_SKIP_UNREADABLE value is a bad_setting error; the known values still work", () => {
+  const saved = process.env.SPEND_BRAKES_SKIP_UNREADABLE;
+  try {
+    for (const bad of ["maybe", "2", "enabled", "disabled", "y", "tru"]) {
+      process.env.SPEND_BRAKES_SKIP_UNREADABLE = bad;
+      assert.throws(() => fileLedger(tmpFile()), brake("bad_setting", /SPEND_BRAKES_SKIP_UNREADABLE.*cannot be read\. Use 1 or 0/), bad);
+    }
+    for (const ok of ["", "0", "false", "OFF", " no ", "1", "true", "On", "YES"]) {
+      process.env.SPEND_BRAKES_SKIP_UNREADABLE = ok;
+      assert.doesNotThrow(() => fileLedger(tmpFile()), ok);
+    }
+    process.env.SPEND_BRAKES_SKIP_UNREADABLE = "maybe";
+    assert.doesNotThrow(() => fileLedger(tmpFile(), { skipUnreadable: false })); // an explicit option is used, and the setting is not read (like Python's Ledger(path, skip_unreadable=...))
+  } finally { if (saved === undefined) delete process.env.SPEND_BRAKES_SKIP_UNREADABLE; else process.env.SPEND_BRAKES_SKIP_UNREADABLE = saved; }
+});
+
+// ---- the skip warning: once per program ------------------------------------------------------------------------
+
+test("skipping unreadable lines warns once per program (console.warn), not on every read and not for every ledger", () => {
+  const moduleUrl = new URL("./spend-brakes.js", import.meta.url).href;
+  const program = `
+    import { checkCall, fileLedger } from ${JSON.stringify(moduleUrl)};
+    import { mkdtempSync, writeFileSync } from "node:fs";
+    import { tmpdir } from "node:os";
+    import { join } from "node:path";
+    const warnings = [];
+    console.warn = (m) => warnings.push(String(m));
+    const dir = mkdtempSync(join(tmpdir(), "sb-"));
+    const a = join(dir, "a.jsonl"), b = join(dir, "b.jsonl"), clean = join(dir, "c.jsonl");
+    writeFileSync(a, "not json\\n");
+    writeFileSync(b, "also not json\\nnor this\\n");
+    const options = { estimateUsd: 0.1, project: "p", provider: "x", job: "j", env: {}, caps: { monthlyUsd: 100, maxCallsPerJob: 5 } };
+    await checkCall({ ...options, ledger: fileLedger(clean, { skipUnreadable: true }) }); // no unreadable line: no warning
+    const before = warnings.length;
+    for (let i = 0; i < 3; i++) await checkCall({ ...options, ledger: fileLedger(a, { skipUnreadable: true }) });
+    await checkCall({ ...options, ledger: fileLedger(b, { skipUnreadable: true }) });
+    console.log(JSON.stringify({ before, warnings }));
+  `;
+  const out = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", program], { encoding: "utf8" }));
+  assert.equal(out.before, 0);
+  assert.equal(out.warnings.length, 1);
+  assert.match(out.warnings[0], /^spend_brakes: skipping 1 unreadable ledger line\(s\); their spend is NOT counted\.$/);
 });

@@ -22,12 +22,25 @@ ENV_PROJECT_PREFIX = "SPEND_PROJECT_CAP_USD_"
 ENV_JOB_CALLS = "SPEND_MAX_CALLS_PER_JOB"
 
 
+def _cleaned(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+
+
 def env_word(name: str) -> str:
     """'blog images' -> 'BLOG_IMAGES' (used inside environment variable names)."""
-    word = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+    word = _cleaned(name)
     if not word:
         raise ConfigError(f"The name {name!r} has no letters or digits, so no setting name can be made from it.")
     return word
+
+
+def project_key(name: str) -> str:
+    """The key that totals use to count a project: the same cleaned-up name as in the setting name.
+
+    'blog-images', 'blog images', 'Blog_Images' and 'BLOG-IMAGES' all give 'BLOG_IMAGES', so they share one project
+    cap and one job count. A name with no letters or digits cannot give a setting name; it keeps its exact text as
+    its key, so such names are still counted one by one. It never raises."""
+    return _cleaned(name) or name
 
 
 def check_money(value: float, label: str) -> float:
@@ -92,3 +105,18 @@ class Caps:
             project_usd=per_project,
             max_calls_per_job=DEFAULT_MAX_CALLS_PER_JOB if calls is None else int(calls),
         )
+
+
+def check_caps(value: object) -> Caps:
+    """Check caps that come from anywhere (a Caps, a Caps made by a trick, any object with the three fields).
+
+    Each field is read ONCE and checked by the same rules as `Caps(...)`: a money cap that is not a finite number of
+    zero or more, or a job limit that is not a whole number from 1 to the hard ceiling, is refused. The result is a
+    new, frozen `Caps` that holds plain values, so a changing property cannot give a different number later."""
+    fields = []
+    for name in ("monthly_usd", "project_usd", "max_calls_per_job"):
+        try:
+            fields.append(getattr(value, name))
+        except AttributeError:
+            raise ConfigError(f"caps must be a Caps object (or have the same three fields); it has no {name}.") from None
+    return Caps(monthly_usd=fields[0], project_usd=fields[1], max_calls_per_job=fields[2])

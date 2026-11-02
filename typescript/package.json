@@ -4,8 +4,6 @@
   "description": "Spend brakes for Node and serverless code that call paid APIs. One file, no runtime dependencies.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/spend-brakes.js",
-  "types": "dist/spend-brakes.d.ts",
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -p .",

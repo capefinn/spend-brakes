@@ -5,6 +5,8 @@ Each paid call writes two rows with the same id:
   settle   written AFTER the call, with the real cost, or 0 when the provider refused the call
 
 The cost of a call is the usd of its last row. Rows are never edited or deleted by this package.
+Rows keep the project name exactly as it was given. Totals count a project by its cleaned-up name (project_key in
+caps.py, the same name as in the setting SPEND_PROJECT_CAP_USD_<PROJECT>), so "blog-images" and "Blog_Images" are one.
 The check against the caps and the reserve row are written under one lock, so two processes cannot both
 exceed the same cap. The lock uses fcntl (macOS, Linux; it may not work on network file systems).
 Without fcntl the lock works inside one process only. Months are UTC calendar months.
@@ -32,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from .caps import check_money
+from .caps import check_money, project_key
 from .errors import ConfigError, LedgerUnreadable
 from .killswitch import STOP_FILE_NAME
 
@@ -51,8 +53,8 @@ _TIME_START = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 @dataclass(frozen=True)
 class Totals:
     month_usd: float  # all projects, this month
-    project_usd: float  # this project, this month
-    job_calls: int  # calls recorded for this project + job (refused calls count too)
+    project_usd: float  # this project, this month (counted by project_key, so spellings of one name are one project)
+    job_calls: int  # calls recorded for this project + job (refused calls count too; same project_key rule)
     unreadable_lines: int  # lines skipped because of skip_unreadable=True (always 0 otherwise)
 
 
@@ -243,12 +245,14 @@ class Ledger:
                 call["usd"] = row["usd"]
         month_usd = project_usd = 0.0
         job_calls = 0
+        wanted = project_key(project)  # rows keep the original text; the counting uses the cleaned-up name
         for call in calls.values():
-            if call["project"] == project and call["job"] == job:
+            same_project = project_key(call["project"]) == wanted
+            if same_project and call["job"] == job:
                 job_calls += 1
             if call["month"] == month:
                 month_usd += call["usd"]
-                if call["project"] == project:
+                if same_project:
                     project_usd += call["usd"]
         return Totals(round(month_usd, 6), round(project_usd, 6), job_calls, skipped)
 

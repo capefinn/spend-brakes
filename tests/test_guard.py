@@ -85,6 +85,49 @@ def test_project_cap_stops_one_project_and_leaves_the_others(call):
     call(Script("ok"), caps=Caps(monthly_usd=100.0), project="other")  # another project is not blocked
 
 
+# ---- one project, many spellings -------------------------------------------------------------------------------
+
+SPELLINGS = ["blog-images", "blog images", "Blog_Images", "BLOG-IMAGES"]  # all give the setting SPEND_PROJECT_CAP_USD_BLOG_IMAGES
+
+
+def test_the_project_cap_is_one_cap_for_every_spelling_of_the_project_name(call, ledger):
+    caps = Caps(monthly_usd=100.0, project_usd=0.40)
+    for spelling in SPELLINGS:  # four calls of $0.10, one for each spelling: exactly the cap
+        call(Script("ok"), caps=caps, project=spelling)
+    for spelling in SPELLINGS:  # now every spelling is stopped, not only the last one
+        with pytest.raises(ProjectCapReached) as stop:
+            call(Script("ok"), caps=caps, project=spelling)
+        assert "SPEND_PROJECT_CAP_USD_BLOG_IMAGES" in str(stop.value)
+    assert {ledger.project_total(spelling) for spelling in SPELLINGS} == {0.40}
+    # the rows keep the text exactly as it was given
+    assert [row["project"] for row in ledger.rows() if row["event"] == "reserve"] == SPELLINGS
+    call(Script("ok"), caps=caps, project="blog-images-2")  # another name is another project
+    call(Script("ok"), caps=caps, project="blog")
+
+
+def test_the_job_limit_counts_every_spelling_of_the_project_name_together(call):
+    caps, fn = Caps(monthly_usd=100.0, max_calls_per_job=4), Script("ok")
+    for spelling in SPELLINGS:
+        call(fn, caps=caps, project=spelling, job="run-1")
+    for spelling in SPELLINGS:
+        with pytest.raises(JobLimitReached):
+            call(fn, caps=caps, project=spelling, job="run-1")
+    call(fn, caps=caps, project="blog-images", job="run-2")  # another job is not affected
+    call(fn, caps=caps, project="other-project", job="run-1")  # another project is not affected
+    assert fn.calls == 6
+
+
+def test_finnish_and_non_latin_project_names_are_counted_without_errors(call, ledger):
+    caps = Caps(monthly_usd=100.0, project_usd=0.20)
+    for spelling in ["Kuvat äänet", "kuvat-äänet", "KUVAT_ÄÄNET"]:  # letters outside A-Z are cleaned away like in the setting name
+        assert ledger.project_total(spelling) == 0
+    call(Script("ok"), caps=caps, project="Kuvat äänet")
+    assert ledger.project_total("kuvat-äänet") == 0.10
+    call(Script("ok"), caps=caps, project="ブログ")  # no A-Z or 0-9 at all: counted under its exact text
+    assert ledger.project_total("ブログ") == 0.10 and ledger.project_total("ニュース") == 0
+    assert ledger.project_total("---") == 0 and ledger.project_total("") == 0
+
+
 # ---- the job limit ---------------------------------------------------------------------------------------------
 
 def test_job_limit_stops_a_loop_and_another_job_is_unaffected(call):

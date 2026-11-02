@@ -2,6 +2,7 @@
 // Same five brakes and the same ledger row format as the Python package, so both can share one ledger file.
 // Brakes, checked before EVERY attempt: kill switch, job limit, project cap, monthly cap. Then the retry rules.
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 // Part of the code on purpose: no argument and no environment variable can raise these two numbers.
@@ -27,11 +28,17 @@ export class BrakeError extends Error {
 
 const usd = (x: number) => (x === 0 || x >= 0.01 ? `$${x.toFixed(2)}` : `$${x.toFixed(4)}`);
 const round6 = (x: number) => Math.round(x * 1e6) / 1e6;
+const cleaned = (name: string) => name.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
 const envWord = (name: string) => {
-  const w = name.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  const w = cleaned(name);
   if (!w) throw new BrakeError("bad_setting", `The name "${name}" has no letters or digits.`);
   return w;
 };
+/** The key that totals use to count a project: the same cleaned-up name as in the setting name.
+ *  "blog-images", "blog images", "Blog_Images" and "BLOG-IMAGES" all give "BLOG_IMAGES", so they share one project cap
+ *  and one job count. A name with no letters or digits keeps its exact text as its key. It never throws.
+ *  A Ledger you write yourself must count the project total and the job count by this key. */
+export const projectKey = (name: string): string => cleaned(name) || name;
 const money = (v: unknown, label: string): number => {
   if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new BrakeError("bad_setting", `${label} must be a number that is zero or more (got ${String(v)}).`);
   return v;
@@ -40,17 +47,30 @@ const money = (v: unknown, label: string): number => {
 // ---- caps -----------------------------------------------------------------------------------------------------
 export interface Caps { readonly monthlyUsd: number; readonly projectUsd?: number; readonly maxCallsPerJob: number }
 
-export function makeCaps(c: { monthlyUsd?: number; projectUsd?: number; maxCallsPerJob?: number } = {}): Caps {
-  const n = c.maxCallsPerJob ?? DEFAULT_MAX_CALLS_PER_JOB;
-  if (!Number.isInteger(n) || n < 1) throw new BrakeError("bad_setting", `maxCallsPerJob must be a whole number of 1 or more (got ${String(n)}).`);
+// The one place where caps are checked. Values are passed in (not an object), so each field of a caller's object is read once.
+function buildCaps(monthlyUsd: unknown, projectUsd: unknown, maxCallsPerJob: unknown): Caps {
+  const n = maxCallsPerJob;
+  if (typeof n !== "number" || !Number.isInteger(n) || n < 1) throw new BrakeError("bad_setting", `maxCallsPerJob must be a whole number of 1 or more (got ${String(n)}).`);
   if (n > HARD_MAX_CALLS_PER_JOB) {
     throw new BrakeError("hard_ceiling", `maxCallsPerJob=${n} is above the hard ceiling of ${HARD_MAX_CALLS_PER_JOB}. The ceiling is written into the code on purpose, so no setting can raise it. Only the owner can change it, in the code (HARD_MAX_CALLS_PER_JOB in this file), with a review.`);
   }
   return Object.freeze({
-    monthlyUsd: money(c.monthlyUsd ?? DEFAULT_MONTHLY_CAP_USD, "monthlyUsd"),
-    projectUsd: c.projectUsd === undefined ? undefined : money(c.projectUsd, "projectUsd"),
+    monthlyUsd: money(monthlyUsd, "monthlyUsd"),
+    projectUsd: projectUsd === undefined ? undefined : money(projectUsd, "projectUsd"),
     maxCallsPerJob: n,
   });
+}
+
+export function makeCaps(c: { monthlyUsd?: number; projectUsd?: number; maxCallsPerJob?: number } = {}): Caps {
+  return buildCaps(c.monthlyUsd ?? DEFAULT_MONTHLY_CAP_USD, c.projectUsd, c.maxCallsPerJob ?? DEFAULT_MAX_CALLS_PER_JOB);
+}
+
+/** Check caps that come from anywhere (a plain object, `as Caps`, a getter): the same rules as makeCaps, but nothing
+ *  is filled in with a default. Every field is read once, and the result is a new frozen Caps made of plain numbers. */
+function checkCaps(c: unknown): Caps {
+  if (typeof c !== "object" || c === null) throw new BrakeError("bad_setting", `caps must be an object with monthlyUsd, projectUsd and maxCallsPerJob, for example from makeCaps() (got ${String(c)}).`);
+  const f = c as Record<string, unknown>;
+  return buildCaps(f.monthlyUsd, f.projectUsd, f.maxCallsPerJob);
 }
 
 /** Read SPEND_MONTHLY_CAP_USD, SPEND_PROJECT_CAP_USD_<PROJECT> and SPEND_MAX_CALLS_PER_JOB. */
@@ -98,7 +118,8 @@ export function checkKillSwitch(provider: string, env: Env = process.env, defaul
 export interface Row { t: string; id: string; event: "reserve" | "settle"; project: string; provider: string; job: string; usd: number; outcome?: string }
 export interface Totals { monthUsd: number; projectUsd: number; jobCalls: number }
 export interface Ledger {
-  /** Must be atomic: read the totals, let `check` throw to refuse, then record the estimate. Returns the call id. */
+  /** Must be atomic: read the totals, let `check` throw to refuse, then record the estimate. Returns the call id.
+   *  Count the project total and the job count by `projectKey(project)`, not by the exact text (see `totalsOf` below). */
   reserve(e: { project: string; provider: string; job: string; usd: number }, check: (t: Totals) => void): Promise<string>;
   settle(e: { id: string; project: string; provider: string; job: string; usd: number; outcome: "ok" | "rejected" | "error" }): Promise<void>;
   /** The read-only twin of `reserve`, used by `checkCall`: read the totals and let `check` throw to refuse. Write nothing. */
@@ -127,9 +148,11 @@ function totalsOf(rows: Row[], project: string, job: string, month: string): Tot
     calls.set(r.id, c);
   }
   let monthUsd = 0, projectUsd = 0, jobCalls = 0;
+  const wanted = projectKey(project); // rows keep the original text; the counting uses the cleaned-up name
   for (const c of calls.values()) {
-    if (c.project === project && c.job === job) jobCalls++;
-    if (c.month === month) { monthUsd += c.usd; if (c.project === project) projectUsd += c.usd; }
+    const sameProject = projectKey(c.project) === wanted;
+    if (sameProject && c.job === job) jobCalls++;
+    if (c.month === month) { monthUsd += c.usd; if (sameProject) projectUsd += c.usd; }
   }
   return { monthUsd: round6(monthUsd), projectUsd: round6(projectUsd), jobCalls };
 }
@@ -162,6 +185,24 @@ export function memoryLedger(now: () => Date = () => new Date()): Ledger & { row
   return { ...rowsLedger({ read: () => rows, append: (r) => void rows.push(r) }, now), rows };
 }
 
+/** The ledger file when you give no other: SPEND_BRAKES_LEDGER, else `.spend-brakes/ledger.jsonl` in your home folder.
+ *  The same rule as the Python package, so a Node program and a Python script share one ledger, and the default stop
+ *  file is the same file (`.spend-brakes/STOP` in your home folder) for both. */
+export function defaultLedgerPath(env: Env = process.env): string {
+  const custom = (env.SPEND_BRAKES_LEDGER ?? "").trim();
+  return custom || join(homedir(), ".spend-brakes", "ledger.jsonl");
+}
+
+// SPEND_BRAKES_SKIP_UNREADABLE: 1/true/on/yes = skip, 0/false/off/no or empty = do not skip, anything else is refused.
+function skipFromEnv(env: Env): boolean {
+  const raw = (env.SPEND_BRAKES_SKIP_UNREADABLE ?? "").trim().toLowerCase();
+  if (["", "0", "false", "off", "no"].includes(raw)) return false;
+  if (["1", "true", "on", "yes"].includes(raw)) return true;
+  throw new BrakeError("bad_setting", `SPEND_BRAKES_SKIP_UNREADABLE="${raw}" cannot be read. Use 1 or 0.`);
+}
+
+let skipWarningShown = false; // the warning about skipped lines is shown once per program, like the Python package
+
 /** A JSONL file. Every row is one append (the system adds the whole line or none of it). Check-and-record is safe
  *  inside one process only; for several processes or servers, write a Ledger over a database transaction instead.
  *  A line that cannot be read means the real spend is not known, so by default every call is REFUSED (ledger_unreadable)
@@ -169,7 +210,7 @@ export function memoryLedger(now: () => Date = () => new Date()): Ledger & { row
  *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never hidden.
  *  A file named STOP in the same folder as the ledger file is the default stop file (SPEND_STOP_FILE replaces it). */
 export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadable?: boolean } = {}): Ledger {
-  const skip = opts.skipUnreadable ?? ["1", "true", "on", "yes"].includes((process.env.SPEND_BRAKES_SKIP_UNREADABLE ?? "").trim().toLowerCase());
+  const skip = opts.skipUnreadable ?? skipFromEnv(process.env);
   const read = (): Row[] => {
     if (!existsSync(path)) return [];
     const rows: Row[] = [], bad: number[] = [];
@@ -177,6 +218,10 @@ export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadabl
       if (!line.trim()) return;
       try { const r = JSON.parse(line); if (rowOk(r)) rows.push(r); else bad.push(i + 1); } catch { bad.push(i + 1); }
     });
+    if (bad.length && skip && !skipWarningShown) {
+      skipWarningShown = true;
+      console.warn(`spend_brakes: skipping ${bad.length} unreadable ledger line(s); their spend is NOT counted.`);
+    }
     if (bad.length && !skip) {
       throw new BrakeError("ledger_unreadable", `Stopped: the ledger file ${path} has ${bad.length} line(s) that cannot be read (line ${bad.slice(0, 5).join(", ")}${bad.length > 5 ? " and more" : ""}). With an unreadable line the real spend is not known, so no paid call is allowed. To repair it, ask the owner to make a copy of the file, then fix or remove only the damaged line(s). Skipping them is the owner's choice and not a repair: the money on those lines is then not counted (setting: SPEND_BRAKES_SKIP_UNREADABLE).`);
     }
@@ -222,24 +267,27 @@ export interface CallOptions {
 
 // Check the options and build the brake check. guardedCall and checkCall both use it, so both run the same brakes.
 function prepare(o: CallOptions) {
-  const env = o.env ?? process.env, job = o.job, maxRetries = o.maxRetries ?? 1;
+  const env = o.env ?? process.env, job = o.job, maxRetries = o.maxRetries === undefined ? 1 : o.maxRetries;
   if (typeof job !== "string" || !job) throw new BrakeError("bad_setting", "job is required: a name that is new for every run of your script, for example \"batch-\" + runId().");
   const estimate = money(o.estimateUsd, "estimateUsd");
   if (!Number.isInteger(maxRetries) || maxRetries < 0) throw new BrakeError("bad_setting", `maxRetries must be a whole number from 0 to ${HARD_MAX_RETRIES} (got ${String(maxRetries)}).`);
   if (maxRetries > HARD_MAX_RETRIES) throw new BrakeError("hard_ceiling", `maxRetries=${maxRetries} is above the hard ceiling of ${HARD_MAX_RETRIES}. The ceiling is written into the code on purpose, so no setting can raise it. Only the owner can change it, in the code (HARD_MAX_RETRIES in this file), with a review.`);
-  const caps = o.caps ?? capsFromEnv(o.project, env);
+  const retryDelayMs = money(o.retryDelayMs === undefined ? 2_000 : o.retryDelayMs, "retryDelayMs");
+  // Caps from any source are checked here, so a plain object or a NaN cannot switch a cap off. Values are read once.
+  const caps = checkCaps(o.caps ?? capsFromEnv(o.project, env));
+  const jobLimit = Math.min(caps.maxCallsPerJob, HARD_MAX_CALLS_PER_JOB); // the last guard: never above the ceiling in the code
 
   const check = (t: Totals) => {
-    if (t.jobCalls >= caps.maxCallsPerJob) throw new BrakeError("job_limit", `Stopped by the job limit: job "${job}" already has ${t.jobCalls} recorded calls (limit ${caps.maxCallsPerJob}, refused calls count too). Look at why the job needs more calls. Ask the owner if the limit should change (setting: SPEND_MAX_CALLS_PER_JOB); the hard ceiling in the code cannot be raised by a setting.`);
+    if (t.jobCalls >= jobLimit) throw new BrakeError("job_limit", `Stopped by the job limit: job "${job}" already has ${t.jobCalls} recorded calls (limit ${jobLimit}, refused calls count too). Look at why the job needs more calls. Ask the owner if the limit should change (setting: SPEND_MAX_CALLS_PER_JOB); the hard ceiling in the code cannot be raised by a setting.`);
     if (caps.projectUsd !== undefined && round6(t.projectUsd + estimate) > caps.projectUsd) throw new BrakeError("project_cap", `Stopped by the project cap: project "${o.project}" spent ${usd(t.projectUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.projectUsd)}. Ask the owner to raise it (setting: SPEND_PROJECT_CAP_USD_${envWord(o.project)}).`);
     if (round6(t.monthUsd + estimate) > caps.monthlyUsd) throw new BrakeError("monthly_cap", `Stopped by the monthly cap: all projects spent ${usd(t.monthUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.monthlyUsd)}. Ask the owner to raise it (setting: SPEND_MONTHLY_CAP_USD).`);
   };
-  return { env, job, estimate, maxRetries, check };
+  return { env, job, estimate, maxRetries, retryDelayMs, check };
 }
 
 /** Run `fn` only after every brake agrees. `fn` must throw on HTTP errors, or return an object with .status (fetch does). */
 export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Promise<T> {
-  const { env, job, estimate, maxRetries, check } = prepare(o);
+  const { env, job, estimate, maxRetries, retryDelayMs, check } = prepare(o);
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const names = { project: o.project, provider: o.provider, job };
 
@@ -260,7 +308,7 @@ export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Prom
       await o.ledger.settle({ id, ...names, usd: estimate, outcome: "error" }); // may have been billed: keep the estimate
       if (!isTransient(error)) throw error;
       if (attempt > maxRetries) throw new BrakeError("retries_exhausted", `Gave up after ${attempt} attempt(s): the provider kept answering with a server error or a timeout. Every attempt is counted in the ledger as a possible cost. Check the provider's status before you run it again. More tries are the owner's choice: raise the maxRetries option of guardedCall (it is an option, not an environment setting; the ceiling is ${HARD_MAX_RETRIES}).`, { cause: error });
-      await sleep((o.retryDelayMs ?? 2_000) * attempt);
+      await sleep(retryDelayMs * attempt);
       continue;
     }
     let cost = estimate;
