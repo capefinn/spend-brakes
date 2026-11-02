@@ -14,7 +14,8 @@ Without fcntl the lock works inside one process only. Months are UTC calendar mo
 
 A line that cannot be read means the real spend is not known. By default the ledger then REFUSES to give totals,
 so no call is allowed until the owner repairs the file. Skipping unreadable lines is an explicit opt-in
-(skip_unreadable=True, or SPEND_BRAKES_SKIP_UNREADABLE=1). An explicit skip_unreadable argument wins over the setting.
+(skip_unreadable=True, or SPEND_BRAKES_SKIP_UNREADABLE=1). An explicit skip_unreadable argument wins over the setting,
+and it must be True or False.
 The warning about skipped lines is shown once per program for each ledger file.
 
 Writes are guarded against cut-off rows: a row is written with one call (the rest is completed if the system writes
@@ -86,8 +87,15 @@ class Ledger:
                  skip_unreadable: Optional[bool] = None):
         self.path = Path(path) if path is not None else default_path()
         self.lock_path = self.path.with_name(self.path.name + ".lock")
-        # An explicit argument wins. Without one, SPEND_BRAKES_SKIP_UNREADABLE decides (an unknown value is a ConfigError).
-        self.skip_unreadable = _skip_from_env(os.environ) if skip_unreadable is None else bool(skip_unreadable)
+        # An explicit argument wins, and it must be a real True or False: the text "false" or the number 0 would be an easy
+        # way to switch skipping ON by mistake. Without an argument, SPEND_BRAKES_SKIP_UNREADABLE decides.
+        if skip_unreadable is None:
+            self.skip_unreadable = _skip_from_env(os.environ)  # an unknown value is a ConfigError
+        elif type(skip_unreadable) is bool:
+            self.skip_unreadable = skip_unreadable
+        else:
+            raise ConfigError(f"skip_unreadable must be True or False (a real bool), or left out to use {ENV_SKIP_UNREADABLE} "
+                              f"(got {skip_unreadable!r}).")
         self._clock = clock or (lambda: _dt.datetime.now(_dt.timezone.utc))
 
     @classmethod

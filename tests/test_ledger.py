@@ -171,6 +171,33 @@ def test_an_explicit_skip_argument_wins_over_the_setting(tmp_path, monkeypatch):
     assert Ledger(tmp_path / "l.jsonl", skip_unreadable=False).skip_unreadable is False
 
 
+@pytest.mark.parametrize("value", ["0", "false", "False", "true", "1", "", " ", 0, 1, 2, 0.0, 1.0, [], [True], object()])
+def test_an_explicit_skip_argument_must_be_a_real_bool(tmp_path, monkeypatch, value):
+    for setting in (None, "1", "0"):  # the setting does not matter: a wrong argument is refused
+        if setting is None:
+            monkeypatch.delenv("SPEND_BRAKES_SKIP_UNREADABLE", raising=False)
+        else:
+            monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", setting)
+        with pytest.raises(ConfigError, match="skip_unreadable must be True or False"):
+            Ledger(tmp_path / "l.jsonl", skip_unreadable=value)
+    assert not (tmp_path / "l.jsonl").exists()
+
+
+def test_skip_false_as_text_does_not_turn_skipping_on_and_a_real_bool_still_works(tmp_path, monkeypatch):
+    path = tmp_path / "l.jsonl"
+    path.write_text("garbage\n")
+    with pytest.raises(ConfigError):
+        Ledger(path, skip_unreadable="false")  # before: this switched skipping ON
+    assert Ledger(path, skip_unreadable=False).skip_unreadable is False
+    assert Ledger(path, skip_unreadable=True).skip_unreadable is True
+    with pytest.raises(LedgerUnreadable):
+        Ledger(path, skip_unreadable=False).month_total()
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", "1")
+    assert Ledger(path, skip_unreadable=None).skip_unreadable is True  # None means: read the setting
+    monkeypatch.delenv("SPEND_BRAKES_SKIP_UNREADABLE")
+    assert Ledger(path, skip_unreadable=None).skip_unreadable is False
+
+
 def test_the_skip_setting_makes_a_damaged_ledger_usable_and_without_it_the_calls_stop(tmp_path, monkeypatch):
     path = tmp_path / "l.jsonl"
     reserve(Ledger(path), 0.10)

@@ -137,7 +137,7 @@ To repair it, the owner makes a copy of the file, finds the line numbers named i
 
 Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`). A warning is shown once per program for each ledger file, even when the number of unreadable lines changes later.
 
-`Ledger(path)` reads `SPEND_BRAKES_SKIP_UNREADABLE` when you do not pass `skip_unreadable`, like `fileLedger(path)` in TypeScript. An argument that you pass wins over the setting. An unknown value is an error in both cases.
+`Ledger(path)` reads `SPEND_BRAKES_SKIP_UNREADABLE` when you do not pass `skip_unreadable`, like `fileLedger(path)` in TypeScript. An argument that you pass wins over the setting, and it must be a real `True` or `False` (in TypeScript `true` or `false`). Text such as `"false"` and numbers such as `0` are a `ConfigError` (TypeScript: `bad_setting`), because they could switch skipping on by mistake. An unknown value of the setting is an error as well.
 
 Writes are guarded against cut-off rows. A row is written with one call, and the rest is written if the system writes only part of it. If an earlier write was cut off, the next row starts on a new line, so the next row is never hidden inside the damaged line.
 

@@ -229,7 +229,11 @@ const skipWarned = new Set<string>(); // ledger files whose skip warning was sho
  *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never hidden.
  *  A file named STOP in the same folder as the ledger file is the default stop file (SPEND_STOP_FILE replaces it). */
 export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadable?: boolean } = {}): Ledger {
-  const skip = opts.skipUnreadable ?? skipFromEnv(process.env);
+  // An explicit option wins, and it must be a real true or false: the text "false" or the number 0 would be an easy way to
+  // switch skipping ON by mistake. Left out (undefined), SPEND_BRAKES_SKIP_UNREADABLE decides.
+  const option: unknown = opts.skipUnreadable; // read once
+  if (option !== undefined && typeof option !== "boolean") throw new BrakeError("bad_setting", `skipUnreadable must be true or false (a real boolean), or left out to use SPEND_BRAKES_SKIP_UNREADABLE (got ${String(option)}).`);
+  const skip = option ?? skipFromEnv(process.env);
   const read = (): Row[] => {
     if (!existsSync(path)) return [];
     const rows: Row[] = [], bad: number[] = [];

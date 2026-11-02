@@ -740,6 +740,29 @@ test("an unknown SPEND_BRAKES_SKIP_UNREADABLE value is a bad_setting error; the 
   } finally { if (saved === undefined) delete process.env.SPEND_BRAKES_SKIP_UNREADABLE; else process.env.SPEND_BRAKES_SKIP_UNREADABLE = saved; }
 });
 
+test("an explicit skipUnreadable must be a real boolean; text and numbers are a bad_setting error, undefined reads the setting", () => {
+  const saved = process.env.SPEND_BRAKES_SKIP_UNREADABLE;
+  try {
+    for (const setting of [undefined, "1", "0"]) {
+      if (setting === undefined) delete process.env.SPEND_BRAKES_SKIP_UNREADABLE; else process.env.SPEND_BRAKES_SKIP_UNREADABLE = setting;
+      for (const bad of ["0", "false", "False", "true", "1", "", 0, 1, 2, null, [], [true], {}]) {
+        assert.throws(() => fileLedger(tmpFile(), { skipUnreadable: bad as any }), brake("bad_setting", /skipUnreadable must be true or false/), `${JSON.stringify(bad)} with setting ${setting}`);
+      }
+    }
+    const path = tmpFile();
+    writeFileSync(path, "garbage\n");
+    assert.doesNotThrow(() => fileLedger(path, { skipUnreadable: true }));
+    assert.doesNotThrow(() => fileLedger(path, { skipUnreadable: false }));
+    // "false" as text must not switch skipping on: the call is refused, not skipped
+    assert.throws(() => fileLedger(path, { skipUnreadable: "false" as any }), brake("bad_setting"));
+    delete process.env.SPEND_BRAKES_SKIP_UNREADABLE;
+    assert.doesNotThrow(() => fileLedger(path, { skipUnreadable: undefined }));
+    assert.doesNotThrow(() => fileLedger(path, {}));
+    process.env.SPEND_BRAKES_SKIP_UNREADABLE = "maybe";
+    assert.throws(() => fileLedger(path, { skipUnreadable: undefined }), brake("bad_setting", /SPEND_BRAKES_SKIP_UNREADABLE/)); // undefined reads the setting
+  } finally { if (saved === undefined) delete process.env.SPEND_BRAKES_SKIP_UNREADABLE; else process.env.SPEND_BRAKES_SKIP_UNREADABLE = saved; }
+});
+
 // ---- the skip warning: once per program ------------------------------------------------------------------------
 
 test("skipping unreadable lines warns once per program for each ledger file (console.warn), not on every read and not when the number of bad lines changes", () => {
