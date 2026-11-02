@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import os
-import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -21,41 +21,114 @@ ENV_MONTHLY = "SPEND_MONTHLY_CAP_USD"
 ENV_PROJECT_PREFIX = "SPEND_PROJECT_CAP_USD_"
 ENV_JOB_CALLS = "SPEND_MAX_CALLS_PER_JOB"
 
-
-def _cleaned(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
-
-
-def env_word(name: str) -> str:
-    """'blog images' -> 'BLOG_IMAGES' (used inside environment variable names)."""
-    word = _cleaned(name)
-    if not word:
-        raise ConfigError(f"The name {name!r} has no letters or digits, so no setting name can be made from it.")
-    return word
+MAX_NAME_LENGTH = 200  # keeps every ledger row short
 
 
 def project_key(name: str) -> str:
-    """The key that totals use to count a project: the same cleaned-up name as in the setting name.
+    """The key of a project or provider name. It is the name inside the setting names, and it is what totals count by.
 
-    'blog-images', 'blog images', 'Blog_Images' and 'BLOG-IMAGES' all give 'BLOG_IMAGES', so they share one project
-    cap and one job count. A name with no letters or digits cannot give a setting name; it keeps its exact text as
-    its key, so such names are still counted one by one. It never raises."""
-    return _cleaned(name) or name
+    Steps: Unicode NFKC normalisation, then case-folding (and NFKC once more, because case-folding can split a letter
+    into a letter and a mark, and Python and TypeScript must give the same key), then every run of characters that are
+    not Unicode letters or digits becomes one "_", the "_" at the start and the end is removed, and the result is
+    written in capital letters. So "blog-images", "Blog_Images" and "BLOG IMAGES" all give "BLOG_IMAGES", and
+    "Kuvat äänet" gives "KUVAT_ÄÄNET" whether the ä is one character or a letter plus a mark. The TypeScript function
+    projectKey gives the same result.
+
+    It does not raise for a str. It gives "" for a name with no letter and no digit (only punctuation, spaces or
+    emoji); guarded_call refuses such a name with ConfigError."""
+    words, current = [], []
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+    for char in folded:
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return "_".join(words).upper()
+
+
+def env_word(name: str, label: str = "name") -> str:
+    """'blog images' -> 'BLOG_IMAGES' (used inside environment variable names). ConfigError when no key can be made."""
+    if type(name) is not str:
+        raise ConfigError(f"The {label} must be plain text (type str, not another type and not a subclass of str).")
+    word = project_key(name)
+    if not word:
+        raise ConfigError(
+            f"The {label} {name!r} has no letter and no digit, so it cannot be used. "
+            "Use a name with at least one letter or digit, for example 'blog-images'."
+        )
+    return word
+
+
+def check_names(project: str, provider: str, job: str) -> None:
+    """Every name must be plain text (type str, not a subclass of it) of 1 to 200 characters. A project and a provider
+    name must also have a key (see project_key). This runs on every call, whether or not a cap is set."""
+    for label, value in (("project", project), ("provider", provider), ("job", job)):
+        if type(value) is not str:
+            raise ConfigError(f"{label} must be plain text (type str, not another type and not a subclass of str).")
+        if not value or len(value) > MAX_NAME_LENGTH:
+            raise ConfigError(f"{label} must be a name of 1 to {MAX_NAME_LENGTH} characters.")
+    env_word(project, "project")
+    env_word(provider, "provider")
 
 
 def check_money(value: float, label: str) -> float:
-    try:
-        usable = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
-    except OverflowError:  # a whole number too big to be turned into a float
-        usable = False
-    if not usable:
+    """Return the value as a plain float, or raise ConfigError. The value is turned into a plain float FIRST and the
+    checks run on that float only, so a subclass of int or float cannot change a comparison."""
+    plain = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            plain = float(value)  # a whole number too big to be a float raises OverflowError
+        except Exception:
+            plain = None
+    if plain is None or not math.isfinite(plain) or plain < 0:
         text = repr(value) if len(repr(value)) <= 40 else repr(value)[:37] + "..."
         raise ConfigError(f"{label} must be a number that is zero or more (got {text}).")
-    return float(value)
+    return plain
 
 
 def check_estimate(value: float) -> float:
     return check_money(value, "estimate_usd")
+
+
+def check_job_limit(value: object) -> int:
+    """A plain int from 1 to the hard ceiling. Above the ceiling is HardCeilingExceeded."""
+    plain = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            plain = int(value)
+        except Exception:
+            plain = None
+    if plain is None or plain < 1:
+        raise ConfigError(f"max_calls_per_job must be a whole number of 1 or more (got {value!r}).")
+    if plain > HARD_MAX_CALLS_PER_JOB:
+        raise HardCeilingExceeded(
+            f"max_calls_per_job={plain} is above the hard ceiling of {HARD_MAX_CALLS_PER_JOB}. "
+            "The ceiling is written into the code on purpose, so no setting can raise it. "
+            "Only the owner can change it, in the code (HARD_MAX_CALLS_PER_JOB in spend_brakes/caps.py), with a review."
+        )
+    return plain
+
+
+def check_retries(value: object) -> int:
+    """A plain int from 0 to the hard ceiling for retries. Above the ceiling is HardCeilingExceeded."""
+    plain = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            plain = int(value)
+        except Exception:
+            plain = None
+    if plain is None or plain < 0:
+        raise ConfigError(f"max_retries must be a whole number from 0 to {HARD_MAX_RETRIES} (got {value!r}).")
+    if plain > HARD_MAX_RETRIES:
+        raise HardCeilingExceeded(
+            f"max_retries={plain} is above the hard ceiling of {HARD_MAX_RETRIES}. The ceiling is written into the "
+            "code on purpose, so no setting can raise it. Only the owner can change it, in the code "
+            "(HARD_MAX_RETRIES in spend_brakes/caps.py), with a review."
+        )
+    return plain
 
 
 def read_number(env: Mapping[str, str], name: str) -> Optional[float]:
@@ -78,25 +151,19 @@ class Caps:
     max_calls_per_job: int = DEFAULT_MAX_CALLS_PER_JOB
 
     def __post_init__(self) -> None:
-        check_money(self.monthly_usd, "monthly_usd")
+        # Check, then keep the plain value that was checked. A subclass of int or float is never kept: a subclass can
+        # change how it compares, so only int(...) and float(...) results are stored.
+        object.__setattr__(self, "monthly_usd", check_money(self.monthly_usd, "monthly_usd"))
         if self.project_usd is not None:
-            check_money(self.project_usd, "project_usd")
-        n = self.max_calls_per_job
-        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-            raise ConfigError(f"max_calls_per_job must be a whole number of 1 or more (got {n!r}).")
-        if n > HARD_MAX_CALLS_PER_JOB:
-            raise HardCeilingExceeded(
-                f"max_calls_per_job={n} is above the hard ceiling of {HARD_MAX_CALLS_PER_JOB}. "
-                "The ceiling is written into the code on purpose, so no setting can raise it. "
-                "Only the owner can change it, in the code (HARD_MAX_CALLS_PER_JOB in spend_brakes/caps.py), with a review."
-            )
+            object.__setattr__(self, "project_usd", check_money(self.project_usd, "project_usd"))
+        object.__setattr__(self, "max_calls_per_job", check_job_limit(self.max_calls_per_job))
 
     @classmethod
     def from_env(cls, project: str, env: Optional[Mapping[str, str]] = None) -> "Caps":
         """Read the caps from the environment, so every script on the machine sees the same numbers."""
         env = os.environ if env is None else env
         monthly = read_number(env, ENV_MONTHLY)
-        per_project = read_number(env, ENV_PROJECT_PREFIX + env_word(project))
+        per_project = read_number(env, ENV_PROJECT_PREFIX + env_word(project, "project"))
         calls = read_number(env, ENV_JOB_CALLS)
         if calls is not None and (not math.isfinite(calls) or calls != int(calls)):
             raise ConfigError(f"{ENV_JOB_CALLS}={calls} must be a whole number.")

@@ -119,11 +119,11 @@ def test_the_job_limit_counts_every_spelling_of_the_project_name_together(call):
 
 def test_finnish_and_non_latin_project_names_are_counted_without_errors(call, ledger):
     caps = Caps(monthly_usd=100.0, project_usd=0.20)
-    for spelling in ["Kuvat äänet", "kuvat-äänet", "KUVAT_ÄÄNET"]:  # letters outside A-Z are cleaned away like in the setting name
+    for spelling in ["Kuvat äänet", "kuvat-äänet", "KUVAT_ÄÄNET"]:  # letters outside A-Z count: one key for all three
         assert ledger.project_total(spelling) == 0
     call(Script("ok"), caps=caps, project="Kuvat äänet")
     assert ledger.project_total("kuvat-äänet") == 0.10
-    call(Script("ok"), caps=caps, project="ブログ")  # no A-Z or 0-9 at all: counted under its exact text
+    call(Script("ok"), caps=caps, project="ブログ")  # a name in another script is a normal name
     assert ledger.project_total("ブログ") == 0.10 and ledger.project_total("ニュース") == 0
     assert ledger.project_total("---") == 0 and ledger.project_total("") == 0
 

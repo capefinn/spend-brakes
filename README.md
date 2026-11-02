@@ -26,6 +26,8 @@ Every brake is checked before every attempt, retries included. A stop is an erro
 
 The guard checks every cap again before every call, whatever it came from: an environment setting, a `Caps` object, or any other object. A cap that is not a number of zero or more is an error (`ConfigError`; in TypeScript a `BrakeError` with `.brake` set to `bad_setting`). A job limit above 20 is refused (`HardCeilingExceeded`; in TypeScript `hard_ceiling`). The same is true for `max_retries` above 3.
 
+The guard keeps plain values only. After a number is checked, it is turned into a plain `int` or `float`, and only that plain value is used. A class that changes how numbers compare cannot move a cap or a ceiling. The names `project`, `provider` and `job` must be exactly of type `str`. A subclass of `str` is a `ConfigError`. In TypeScript each of them must be a string (`bad_setting`), and each option is read once per call.
+
 Behind the brakes is the **ledger**: one append-only file (JSON Lines) that every script writes to. The estimated cost is written *before* the call. The real cost, or 0 if the provider refused the call, is written *after*. If a program crashes in the middle, the estimate stays and keeps counting.
 
 ### A job is one run
@@ -107,7 +109,7 @@ Stopped by the monthly cap: all projects spent $19.97 this month, and this call 
 which would exceed the cap of $20.00. Ask the owner to raise it (setting: SPEND_MONTHLY_CAP_USD).
 ```
 
-Errors you can catch: `BrakeError` (all stops) and its types `KillSwitchOn`, `MonthlyCapReached`, `ProjectCapReached`, `JobLimitReached`, `HardCeilingExceeded`, `NotRetried`, `RetriesExhausted`, `LedgerUnreadable`. Each has `.brake` with the short name. A bad setting (for example a cap that is not a number, or `nan`) raises `ConfigError`. It is never ignored.
+Errors you can catch: `BrakeError` (all stops) and its types `KillSwitchOn`, `MonthlyCapReached`, `ProjectCapReached`, `JobLimitReached`, `HardCeilingExceeded`, `NotRetried`, `RetriesExhausted`, `LedgerUnreadable`. Each has `.brake` with the short name. A bad setting (for example a cap that is not a number, or `nan`) raises `ConfigError`. So does a name that is not allowed (see "A project name becomes a key" below). It is never ignored.
 
 ## Check without calling (a test run that spends nothing)
 
@@ -133,7 +135,9 @@ If any line in the ledger cannot be read, the real spend is not known. All calls
 
 To repair it, the owner makes a copy of the file, finds the line numbers named in the error, and fixes or removes only those lines. `Ledger.unreadable_line_numbers()` lists them, and `Ledger.rows()` still shows the readable rows.
 
-Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`), and a warning is shown once per program.
+Skipping unreadable lines is possible, but it is an explicit choice and not a repair: the money on those lines is then not counted. The owner sets `SPEND_BRAKES_SKIP_UNREADABLE=1` (or `Ledger(skip_unreadable=True)`). A warning is shown once per program for each ledger file, even when the number of unreadable lines changes later.
+
+`Ledger(path)` reads `SPEND_BRAKES_SKIP_UNREADABLE` when you do not pass `skip_unreadable`, like `fileLedger(path)` in TypeScript. An argument that you pass wins over the setting. An unknown value is an error in both cases.
 
 Writes are guarded against cut-off rows. A row is written with one call, and the rest is written if the system writes only part of it. If an earlier write was cut off, the next row starts on a new line, so the next row is never hidden inside the damaged line.
 
@@ -168,8 +172,16 @@ Notes:
   - Some ledgers are not files: the TypeScript `memoryLedger()`, or a ledger you write over a database. They have no default stop file.
 - On macOS and Linux, the Python ledger creates a `.lock` file next to the ledger file (for example `ledger.jsonl.lock`) when it first writes. It is normal, and it may stay.
 - The ledger knows only the spend that was recorded through it. Spend from before you started, or from other tools, is not in it. In the first month, set `SPEND_MONTHLY_CAP_USD` lower than your real monthly limit, to allow for that earlier spend.
-- A switch value that cannot be read (for example `disabled`) counts as STOP, not as GO. A number that cannot be read (`abc`, `nan`, `inf`) is a `ConfigError`. `SPEND_BRAKES_SKIP_UNREADABLE` accepts only `1`, `true`, `on`, `yes` and `0`, `false`, `off`, `no`. Any other value is an error, in Python and in TypeScript.
-- **The project name is cleaned up.** Only the letters A to Z and the digits 0 to 9 count. Every other sign, or group of signs, becomes one `_`, and the result is written in capital letters. So `blog-images`, `blog images`, `Blog_Images` and `BLOG-IMAGES` are all `BLOG_IMAGES`. The setting name uses this cleaned name. The project total and the job count in the ledger use it too, so these four spellings share one project cap and one job count. The rows in the ledger keep the name exactly as you wrote it. Letters such as `ä` and `ö` do not count: `Kuvat äänet` becomes `KUVAT_NET`. Use letters from A to Z in project names. A name with no such letters and no digits (for example one in Japanese) cannot make a setting name. It is counted under its exact text.
+- A switch value that cannot be read (for example `disabled`) counts as STOP, not as GO. A number that cannot be read (`abc`, `nan`, `inf`) is a `ConfigError`. `SPEND_BRAKES_SKIP_UNREADABLE` accepts only `1`, `true`, `on`, `yes` and `0`, `false`, `off`, `no`. Any other value is an error, in Python and in TypeScript, when a ledger is made without the explicit argument.
+- **A project name becomes a key.** The key is used in the setting name, in the project total and in the job count. A provider name becomes a key in the same way, for the setting `SPEND_<KEY>_ENABLED`.
+  - The steps are: Unicode NFKC normalisation (it joins a letter with its mark, and turns full-width letters into normal ones), then case-folding. Then every group of signs that are not letters or digits becomes one `_`. The `_` at the start and at the end is removed. The last step is capital letters.
+  - So `blog-images`, `blog images`, `Blog_Images`, `BLOG-IMAGES` and `BLOG IMAGES` are all `BLOG_IMAGES`. Plain English names work as before.
+  - Letters from other scripts count. `Kuvat äänet` is `KUVAT_ÄÄNET`, whether each `ä` is one character or two. `Äänet` and `net` are different keys. `ブログ v2` and `画像 v2` are different keys. `Москва-2026` and `Киев-2026` are different keys.
+  - The setting name is `SPEND_PROJECT_CAP_USD_<KEY>`, for example `SPEND_PROJECT_CAP_USD_KUVAT_ÄÄNET`. A name in another script works with no project cap set. If its project cap is reached, the call stops with `ProjectCapReached` (a `BrakeError`), as for any other name.
+  - Most shells cannot `export` a setting name with letters outside A to Z. For such a project, give the cap with the `caps` argument, for example `caps=Caps(monthly_usd=20, project_usd=5)` (TypeScript: `caps: makeCaps({ monthlyUsd: 20, projectUsd: 5 })`). Or use a name with the letters A to Z only, when you want to set the cap in the shell.
+  - A name with no letter and no digit has no key. This is a name with only punctuation, spaces or emoji, for example `!!!`. It is a `ConfigError` on every call, with or without a cap (TypeScript: a `BrakeError` with `.brake` set to `bad_setting`). A name must also have 1 to 200 characters.
+  - The rows in the ledger keep the name exactly as you wrote it. The project total and the job count use the key. So the two spellings of `Kuvat äänet` share one project cap and one job count. A job name is not changed: the job count compares it exactly.
+  - Python and Node can know different versions of Unicode. A very new character can then give a different key in the two. Common letters and digits are not affected.
 - The API key goes into an environment variable (a name you choose, for example `IMAGE_API_KEY`). It is never a command argument, never in the URL, and it is removed from error text. Do not write the key in a shell command: other users of the machine can see command lines, and your shell history keeps them. If you must use `curl`, give the header through `curl -K -` and standard input.
 
 ## How to choose the estimate
@@ -201,7 +213,7 @@ for (const body of bodies) {
 - `memoryLedger()` keeps rows in memory (tests, one process). It has no default stop file.
 - `fileLedger(path)` writes the file. You give the path. `defaultLedgerPath()` gives the same default as Python: `SPEND_BRAKES_LEDGER`, or else `~/.spend-brakes/ledger.jsonl`.
 - `fileLedger` is safe inside one process. Node has no file lock without extra packages. Two processes that write at the same moment can pass the same cap by a small amount. This includes a Node program and a Python script that share the file.
-- `fileLedger` refuses to work with an unreadable line, like the Python ledger. `fileLedger(path, { skipUnreadable: true })` is the explicit choice to skip such lines. It then shows a warning with `console.warn`, once per program.
+- `fileLedger` refuses to work with an unreadable line, like the Python ledger. `fileLedger(path, { skipUnreadable: true })` is the explicit choice to skip such lines. It then shows a warning with `console.warn`, once per program for each ledger file. `fileLedger(path)` reads `SPEND_BRAKES_SKIP_UNREADABLE` when you do not pass `skipUnreadable`. The option that you pass wins.
 - A file named `STOP` in the same folder is the default stop file. For the default ledger it is `~/.spend-brakes/STOP`, the same file the Python package uses.
 - Serverless functions have no shared disk. Write a small `Ledger` over a database. It has three methods: `reserve`, `settle` and `preview`.
   - `reserve` must read the totals, run the check and write the estimate as one atomic step.

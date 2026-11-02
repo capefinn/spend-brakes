@@ -5,15 +5,17 @@ Each paid call writes two rows with the same id:
   settle   written AFTER the call, with the real cost, or 0 when the provider refused the call
 
 The cost of a call is the usd of its last row. Rows are never edited or deleted by this package.
-Rows keep the project name exactly as it was given. Totals count a project by its cleaned-up name (project_key in
-caps.py, the same name as in the setting SPEND_PROJECT_CAP_USD_<PROJECT>), so "blog-images" and "Blog_Images" are one.
+Rows keep the project name exactly as it was given. Totals count a project by its key (project_key in caps.py, the
+same key as in the setting SPEND_PROJECT_CAP_USD_<KEY>), so "blog-images" and "Blog_Images" are one project, and so are
+"Kuvat äänet" written with one character or with two for each ä.
 The check against the caps and the reserve row are written under one lock, so two processes cannot both
 exceed the same cap. The lock uses fcntl (macOS, Linux; it may not work on network file systems).
 Without fcntl the lock works inside one process only. Months are UTC calendar months.
 
 A line that cannot be read means the real spend is not known. By default the ledger then REFUSES to give totals,
 so no call is allowed until the owner repairs the file. Skipping unreadable lines is an explicit opt-in
-(skip_unreadable=True, or SPEND_BRAKES_SKIP_UNREADABLE=1).
+(skip_unreadable=True, or SPEND_BRAKES_SKIP_UNREADABLE=1). An explicit skip_unreadable argument wins over the setting.
+The warning about skipped lines is shown once per program for each ledger file.
 
 Writes are guarded against cut-off rows: a row is written with one call (the rest is completed if the system writes
 only part of it), and if an earlier write left a line without its end-of-line mark, the next row starts on a new line,
@@ -34,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from .caps import check_money, project_key
+from .caps import check_money, check_names, project_key
 from .errors import ConfigError, LedgerUnreadable
 from .killswitch import STOP_FILE_NAME
 
@@ -45,8 +47,9 @@ except ImportError:  # pragma: no cover
 
 ENV_LEDGER = "SPEND_BRAKES_LEDGER"
 ENV_SKIP_UNREADABLE = "SPEND_BRAKES_SKIP_UNREADABLE"
-MAX_NAME_LENGTH = 200  # keeps every row short
 _THREAD_LOCK = threading.Lock()
+_WARN_LOCK = threading.Lock()
+_WARNED_PATHS: set = set()  # ledger files for which the skip warning was shown already (once per program for each file)
 _TIME_START = re.compile(r"^\d{4}-\d{2}-\d{2}T")
 
 
@@ -73,12 +76,6 @@ def _skip_from_env(env: Mapping[str, str]) -> bool:
     raise ConfigError(f"{ENV_SKIP_UNREADABLE}={raw!r} cannot be read. Use 1 or 0.")
 
 
-def check_names(project: str, provider: str, job: str) -> None:
-    for label, value in (("project", project), ("provider", provider), ("job", job)):
-        if not isinstance(value, str) or not value or len(value) > MAX_NAME_LENGTH:
-            raise ConfigError(f"{label} must be a name of 1 to {MAX_NAME_LENGTH} characters.")
-
-
 def run_id() -> str:
     """A new id for every run of a script, to use inside a job name: job="batch-" + run_id()."""
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
@@ -86,10 +83,11 @@ def run_id() -> str:
 
 class Ledger:
     def __init__(self, path: Optional[os.PathLike] = None, clock: Optional[Callable[[], _dt.datetime]] = None,
-                 skip_unreadable: bool = False):
+                 skip_unreadable: Optional[bool] = None):
         self.path = Path(path) if path is not None else default_path()
         self.lock_path = self.path.with_name(self.path.name + ".lock")
-        self.skip_unreadable = skip_unreadable
+        # An explicit argument wins. Without one, SPEND_BRAKES_SKIP_UNREADABLE decides (an unknown value is a ConfigError).
+        self.skip_unreadable = _skip_from_env(os.environ) if skip_unreadable is None else bool(skip_unreadable)
         self._clock = clock or (lambda: _dt.datetime.now(_dt.timezone.utc))
 
     @classmethod
@@ -108,7 +106,7 @@ class Ledger:
                 check: Callable[[Totals], None]) -> str:
         """Under the lock: read the totals, let `check` refuse (it raises), then write the reserve row."""
         check_names(project, provider, job)
-        check_money(usd, "estimate_usd")
+        usd = check_money(usd, "estimate_usd")  # the plain float is what is checked and what is written
         with self._locked():
             rows, bad = self._read_rows()
             self._require_readable(bad)
@@ -122,14 +120,14 @@ class Ledger:
         """The read-only twin of `reserve`: the same name check, the same rule for unreadable lines and the same `check`
         (it raises to refuse), but nothing is written. No lock is taken, and no file or folder is made."""
         check_names(project, provider, job)
-        check_money(usd, "estimate_usd")
+        usd = check_money(usd, "estimate_usd")
         rows, bad = self._read_rows()
         self._require_readable(bad)
         check(self._totals(rows, len(bad), project, job))
 
     def settle(self, call_id: str, *, project: str, provider: str, job: str, usd: float, outcome: str) -> None:
         """Write the final cost of a call. `outcome` is ok, rejected or error."""
-        check_money(usd, "usd")
+        usd = check_money(usd, "usd")
         with self._locked():
             self._append({"event": "settle", "id": call_id, "project": project, "provider": provider,
                           "job": job, "usd": usd, "outcome": outcome})
@@ -222,7 +220,12 @@ class Ledger:
         if not bad:
             return
         if self.skip_unreadable:
-            warnings.warn(f"spend_brakes: skipping {len(bad)} unreadable ledger line(s); their spend is NOT counted.")
+            key = os.path.abspath(self.path)
+            with _WARN_LOCK:
+                first_time = key not in _WARNED_PATHS
+                _WARNED_PATHS.add(key)
+            if first_time:  # once per program for each ledger file, even when the number of bad lines changes
+                warnings.warn(f"spend_brakes: skipping {len(bad)} unreadable ledger line(s) in {self.path}; their spend is NOT counted.")
             return
         shown = ", ".join(str(n) for n in bad[:5]) + (" and more" if len(bad) > 5 else "")
         raise LedgerUnreadable(

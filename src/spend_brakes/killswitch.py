@@ -25,7 +25,7 @@ _OFF = {"0", "false", "off", "no"}
 
 
 def provider_env_name(provider: str) -> str:
-    return f"SPEND_{env_word(provider)}_ENABLED"
+    return f"SPEND_{env_word(provider, 'provider')}_ENABLED"
 
 
 def _word(env: Mapping[str, str], name: str) -> Optional[str]:

@@ -563,23 +563,106 @@ test("a row written under one spelling (for example by the Python package) count
   await guardedCall(script("ok"), { ...base, ledger: fileLedger(path), caps, project: "blog-images", estimateUsd: 0.05 });
 });
 
-test("projectKey: the key of a setting name; Finnish letters are cleaned like the setting name; a name without letters keeps its text", () => {
-  for (const name of [...SPELLINGS, "  blog -- images  ", "__blog.images__"]) assert.equal(projectKey(name), "BLOG_IMAGES", name);
-  assert.notEqual(projectKey("blog-images-2"), projectKey("blog-images"));
-  assert.equal(projectKey("Kuvat äänet"), "KUVAT_NET");
-  assert.equal(projectKey("kuvat-äänet"), projectKey("Kuvat äänet"));
-  assert.equal(projectKey("---"), "---");
-  assert.equal(projectKey("ブログ"), "ブログ");
-  assert.notEqual(projectKey("ニュース"), projectKey("ブログ"));
-  assert.equal(projectKey(""), ""); // never throws
+const FI_NFC = "Kuvat äänet".normalize("NFC"), FI_NFD = "Kuvat äänet".normalize("NFD");
+// The same table is in tests/test_names.py. Keep the two tables equal.
+const KEYS: [string, string][] = [
+  ["blog-images", "BLOG_IMAGES"], ["Blog_Images", "BLOG_IMAGES"], ["BLOG IMAGES", "BLOG_IMAGES"],
+  ["  blog -- images  ", "BLOG_IMAGES"], ["__blog.images__", "BLOG_IMAGES"], ["blog-images-2", "BLOG_IMAGES_2"],
+  [FI_NFC, "KUVAT_ÄÄNET"], [FI_NFD, "KUVAT_ÄÄNET"], ["kuvat-äänet", "KUVAT_ÄÄNET"], ["KUVAT_ÄÄNET", "KUVAT_ÄÄNET"],
+  ["Äänet", "ÄÄNET"], ["net", "NET"],
+  ["ブログ", "ブログ"], ["ブログ v2", "ブログ_V2"], ["画像 v2", "画像_V2"], ["ﾌﾞﾛｸﾞ", "ブログ"],
+  ["مدونة", "مدونة"],
+  ["Блог", "БЛОГ"], ["Москва-2026", "МОСКВА_2026"], ["Киев-2026", "КИЕВ_2026"],
+  ["Straße", "STRASSE"], ["ＢＬＯＧ　ｉｍａｇｅｓ", "BLOG_IMAGES"], ["ΐ", "Ϊ́"],
+  ["!!!", ""], ["---", ""], ["   ", ""], ["🚀", ""], ["🚀🚀", ""], ["", ""],
+];
+const EMPTY_KEY = ["!!!", "---", "   ", "...", "🚀", "🚀 🚀", "—", "_"];
+const OTHER_SCRIPTS = [FI_NFC, FI_NFD, "ブログ", "画像 v2", "مدونة", "Блог", "Москва-2026"];
+
+test("projectKey: NFKC, case-fold, runs of non-letters and non-digits become _, capital letters; the same table as Python", () => {
+  for (const [name, key] of KEYS) assert.equal(projectKey(name), key, JSON.stringify(name));
+  assert.notEqual(FI_NFC, FI_NFD);
+  assert.notEqual(projectKey("Äänet"), projectKey("net"));
+  assert.notEqual(projectKey("ブログ v2"), projectKey("画像 v2"));
+  assert.notEqual(projectKey("Москва-2026"), projectKey("Киев-2026"));
 });
 
-test("Finnish and non-Latin project names are counted without errors", async () => {
-  const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.2 });
-  await guardedCall(script("ok"), { ...base, ledger, caps, project: "Kuvat äänet" });
-  await guardedCall(script("ok"), { ...base, ledger, caps, project: "kuvat-äänet" });
-  await guardedCall(script("ok"), { ...base, ledger, caps, project: "ブログ" }); // no A-Z or 0-9: counted under its exact text
-  await guardedCall(script("ok"), { ...base, ledger, caps, project: "ニュース" }); // another such name is another project
+test("a project name in another script works when no project cap is set, as caps from the environment and as an argument", async () => {
+  for (const project of OTHER_SCRIPTS) {
+    const ledger = memoryLedger(), fn = script("ok");
+    for (let i = 0; i < 3; i++) {
+      await guardedCall(fn, { ...base, ledger, project, caps: undefined, env: { SPEND_MONTHLY_CAP_USD: "100" } });
+      await guardedCall(fn, { ...base, ledger, project });
+    }
+    assert.equal(fn.calls, 6, project);
+    await guardedCall(fn, { ...base, ledger: memoryLedger(), provider: project }); // as a provider name too
+  }
+});
+
+test("a project cap reached by a name in another script is a project_cap brake, never a bad_setting error", async () => {
+  for (const project of OTHER_SCRIPTS) {
+    const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.25, maxCallsPerJob: 20 }), fn = script("ok");
+    await guardedCall(fn, { ...base, ledger, caps, project });
+    await guardedCall(fn, { ...base, ledger, caps, project });
+    await assert.rejects(guardedCall(fn, { ...base, ledger, caps, project }), brake("project_cap", new RegExp(`SPEND_PROJECT_CAP_USD_${projectKey(project)}`)), project);
+    assert.equal(fn.calls, 2, project);
+  }
+});
+
+test("the project cap setting works for a Finnish name in either form, and both forms share one total and one job count", async () => {
+  const env = { SPEND_MONTHLY_CAP_USD: "100", SPEND_PROJECT_CAP_USD_KUVAT_ÄÄNET: "0.25", SPEND_MAX_CALLS_PER_JOB: "20" };
+  const ledger = memoryLedger(), fn = script("ok");
+  await guardedCall(fn, { ...base, ledger, project: FI_NFC, caps: undefined, env });
+  await guardedCall(fn, { ...base, ledger, project: FI_NFD, caps: undefined, env });
+  for (const project of [FI_NFC, FI_NFD]) await assert.rejects(guardedCall(fn, { ...base, ledger, project, caps: undefined, env }), brake("project_cap"), project);
+  assert.deepEqual(ledger.rows.filter((r) => r.event === "reserve").map((r) => r.project), [FI_NFC, FI_NFD]); // rows keep each text
+
+  const jobs = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, maxCallsPerJob: 3 });
+  await guardedCall(fn, { ...base, ledger: jobs, caps, project: FI_NFC, job: "run-1" });
+  await guardedCall(fn, { ...base, ledger: jobs, caps, project: FI_NFD, job: "run-1" });
+  await guardedCall(fn, { ...base, ledger: jobs, caps, project: FI_NFC, job: "run-1" });
+  for (const project of [FI_NFC, FI_NFD]) await assert.rejects(guardedCall(fn, { ...base, ledger: jobs, caps, project, job: "run-1" }), brake("job_limit"), project);
+});
+
+test("a file ledger counts both forms of a Finnish name together", async () => {
+  const path = tmpFile(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.3, maxCallsPerJob: 20 });
+  for (const project of [FI_NFC, FI_NFD, FI_NFC]) await guardedCall(script("ok"), { ...base, ledger: fileLedger(path), caps, project });
+  for (const project of [FI_NFC, FI_NFD]) await assert.rejects(guardedCall(script("ok"), { ...base, ledger: fileLedger(path), caps, project }), brake("project_cap"), project);
+});
+
+test("different names do not share a cap", async () => {
+  for (const [first, second] of [["Äänet", "net"], ["ブログ v2", "画像 v2"], ["Москва-2026", "Киев-2026"], ["ブログ", "画像"]]) {
+    const ledger = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, projectUsd: 0.25, maxCallsPerJob: 20 }), fn = script("ok");
+    for (const project of [first, second]) {
+      await guardedCall(fn, { ...base, ledger, caps, project });
+      await guardedCall(fn, { ...base, ledger, caps, project });
+      await assert.rejects(guardedCall(fn, { ...base, ledger, caps, project }), brake("project_cap"), project);
+    }
+    assert.equal(fn.calls, 4, `${first} / ${second}`);
+  }
+});
+
+test("the provider switch for a name in another script", async () => {
+  for (const [provider, setting] of [["ブログ", "SPEND_ブログ_ENABLED"], [FI_NFC, "SPEND_KUVAT_ÄÄNET_ENABLED"], [FI_NFD, "SPEND_KUVAT_ÄÄNET_ENABLED"]]) {
+    await assert.rejects(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), provider, env: { [setting]: "0" } }), brake("kill_switch", new RegExp(setting)), provider);
+  }
+});
+
+test("a name with no letter and no digit is a bad_setting error at once, on every call, whether or not a cap is set", async () => {
+  for (const field of ["project", "provider"]) for (const name of EMPTY_KEY) {
+    const ledger = memoryLedger(), fn = script("ok"), why = `${field} ${JSON.stringify(name)}`;
+    const say = brake("bad_setting", new RegExp(`The ${field} .* has no letter and no digit`));
+    await assert.rejects(guardedCall(fn, { ...base, ledger, [field]: name }), say, why); // caps given, no project cap
+    await assert.rejects(guardedCall(fn, { ...base, ledger, [field]: name, caps: undefined, env: { SPEND_MONTHLY_CAP_USD: "100" } }), say, why); // caps from the environment
+    await assert.rejects(guardedCall(fn, { ...base, ledger, [field]: name, caps: makeCaps({ monthlyUsd: 100, projectUsd: 5 }) }), say, why); // with a project cap
+    await assert.rejects(checkCall({ ...base, ledger, [field]: name }), say, why);
+    assert.equal(fn.calls, 0, why);
+    assert.equal(ledger.rows.length, 0, why);
+  }
+});
+
+test("a job name is not a key, so punctuation alone is allowed there", async () => {
+  await guardedCall(script("ok"), { ...base, ledger: memoryLedger(), job: "!!!" });
 });
 
 // ---- the default ledger file and the default stop file are the same as in Python ------------------------------
@@ -623,11 +706,11 @@ test("an unknown SPEND_BRAKES_SKIP_UNREADABLE value is a bad_setting error; the 
 
 // ---- the skip warning: once per program ------------------------------------------------------------------------
 
-test("skipping unreadable lines warns once per program (console.warn), not on every read and not for every ledger", () => {
+test("skipping unreadable lines warns once per program for each ledger file (console.warn), not on every read and not when the number of bad lines changes", () => {
   const moduleUrl = new URL("./spend-brakes.js", import.meta.url).href;
   const program = `
     import { checkCall, fileLedger } from ${JSON.stringify(moduleUrl)};
-    import { mkdtempSync, writeFileSync } from "node:fs";
+    import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
     import { tmpdir } from "node:os";
     import { join } from "node:path";
     const warnings = [];
@@ -640,11 +723,104 @@ test("skipping unreadable lines warns once per program (console.warn), not on ev
     await checkCall({ ...options, ledger: fileLedger(clean, { skipUnreadable: true }) }); // no unreadable line: no warning
     const before = warnings.length;
     for (let i = 0; i < 3; i++) await checkCall({ ...options, ledger: fileLedger(a, { skipUnreadable: true }) });
+    appendFileSync(a, "one more bad line\\n"); // the number of bad lines changes: still no second warning for this file
+    for (let i = 0; i < 3; i++) await checkCall({ ...options, ledger: fileLedger(a, { skipUnreadable: true }) });
+    await checkCall({ ...options, ledger: fileLedger(b, { skipUnreadable: true }) }); // another file: its own warning
     await checkCall({ ...options, ledger: fileLedger(b, { skipUnreadable: true }) });
     console.log(JSON.stringify({ before, warnings }));
   `;
   const out = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", program], { encoding: "utf8" }));
   assert.equal(out.before, 0);
-  assert.equal(out.warnings.length, 1);
-  assert.match(out.warnings[0], /^spend_brakes: skipping 1 unreadable ledger line\(s\); their spend is NOT counted\.$/);
+  assert.equal(out.warnings.length, 2); // one for a.jsonl and one for b.jsonl, and the message names the file
+  assert.match(out.warnings[0], /^spend_brakes: skipping 1 unreadable ledger line\(s\) in .*a\.jsonl; their spend is NOT counted\.$/);
+  assert.match(out.warnings[1], /^spend_brakes: skipping 2 unreadable ledger line\(s\) in .*b\.jsonl; their spend is NOT counted\.$/);
+});
+
+// ---- every option is read once; names must be strings ---------------------------------------------------------------
+
+/** Options in which each listed field is a getter. Reading it more than once is counted, and a later read can give another value. */
+function watched(options: Record<string, unknown>, later: Record<string, unknown> = {}) {
+  const reads: Record<string, number> = {};
+  const o: Record<string, unknown> = {};
+  for (const key of Object.keys(options)) {
+    reads[key] = 0;
+    Object.defineProperty(o, key, { enumerable: true, get() { return reads[key]++ === 0 || !(key in later) ? options[key] : later[key]; } });
+  }
+  return { o: o as any, reads };
+}
+
+test("project, provider, job and ledger are each read ONCE: a getter cannot show one name to the cap check and another to the ledger", async () => {
+  const envCaps = { SPEND_MONTHLY_CAP_USD: "100", SPEND_PROJECT_CAP_USD_BLOG: "0.05", SPEND_MAX_CALLS_PER_JOB: "20" };
+  const ledger = memoryLedger();
+  const totals: number[] = [];
+  for (let i = 0; i < 10; i++) { // a new watched object for each call: its first read gives "other", a second read would give "blog"
+    const { o, reads } = watched(
+      { estimateUsd: 0.01, project: "other", provider: "x", job: "j", ledger, env: envCaps, sleep: noSleep },
+      { project: "blog", provider: "y", job: "k", ledger: memoryLedger() },
+    );
+    await guardedCall(async () => ({ status: 200 }), o);
+    totals.push(...Object.values(reads));
+  }
+  const { o, reads } = watched({ estimateUsd: 0.01, project: "other", provider: "x", job: "j", ledger, env: envCaps }, { project: "blog", provider: "y", job: "k", ledger: memoryLedger() });
+  await checkCall(o);
+  totals.push(...Object.values(reads));
+  assert.ok(totals.every((n) => n === 1), `each option is read once per call (reads: ${totals.join(",")})`);
+  assert.ok(ledger.rows.every((r) => r.project === "other" && r.provider === "x" && r.job === "j"));
+  assert.equal(ledger.rows.filter((r) => r.event === "reserve").length, 10); // no cap of "blog" stopped the "other" project
+});
+
+test("the cap setting is read for the same project name that the ledger records", async () => {
+  const envCaps = { SPEND_MONTHLY_CAP_USD: "100", SPEND_PROJECT_CAP_USD_BLOG: "0.05", SPEND_MAX_CALLS_PER_JOB: "20" };
+  const ledger = memoryLedger(), fn = script({ status: 200 });
+  let stopped: unknown;
+  for (let i = 0; i < 10 && !stopped; i++) {
+    const { o } = watched({ estimateUsd: 0.01, project: "blog", provider: "x", job: "j", ledger, env: envCaps }, { project: "other" });
+    await guardedCall(fn, o).catch((e) => { stopped = e; });
+  }
+  assert.ok(brake("project_cap")(stopped), "the cap of the first name is used"); // stopped by the cap of "blog": 5 calls of $0.01
+  assert.equal(fn.calls, 5);
+  assert.ok(ledger.rows.every((r) => r.project === "blog"));
+});
+
+test("caps, maxRetries, estimateUsd and env are read once as well", async () => {
+  let capsReads = 0, retriesReads = 0, estimateReads = 0;
+  const o: any = { ...base, ledger: memoryLedger(), retryDelayMs: 0 };
+  Object.defineProperty(o, "caps", { enumerable: true, get() { capsReads++; return capsReads === 1 ? makeCaps({ monthlyUsd: 100 }) : makeCaps({ monthlyUsd: 100, maxCallsPerJob: 20 }); } });
+  Object.defineProperty(o, "maxRetries", { enumerable: true, get() { retriesReads++; return retriesReads === 1 ? 1 : 1000; } });
+  Object.defineProperty(o, "estimateUsd", { enumerable: true, get() { estimateReads++; return estimateReads === 1 ? 0.1 : 99; } });
+  const fn = script(Object.assign(new Error("t"), { name: "TimeoutError" }));
+  await assert.rejects(guardedCall(fn, o), brake("retries_exhausted")); // maxRetries is 1 (the first read), not 1000
+  assert.deepEqual([capsReads, retriesReads, estimateReads], [1, 1, 1]);
+  assert.equal(fn.calls, 2);
+  assert.ok(o.ledger.rows.every((r: any) => r.usd === 0.1));
+});
+
+test("a project, provider or job that is not a string is refused: an object with a rigged key cannot get through", async () => {
+  const rigged = { length: 4, replace() { return { replace() { return { toUpperCase: () => "K" + Math.random() }; } }; }, toString: () => "blog" };
+  const jobRigged = { length: 3, toString: () => "job", toJSON: () => "job" };
+  for (const field of ["project", "provider", "job"]) for (const bad of [rigged, jobRigged, 5, null, undefined, ["blog"], new String("blog")]) {
+    const ledger = memoryLedger(), fn = script("ok"), why = `${field} ${String(bad)}`;
+    await assert.rejects(guardedCall(fn, { ...base, ledger, [field]: bad }), brake("bad_setting", /plain text|job is required/), why);
+    await assert.rejects(checkCall({ ...base, ledger, [field]: bad }), brake("bad_setting", /plain text|job is required/), why);
+    assert.equal(fn.calls, 0, why);
+    assert.equal(ledger.rows.length, 0, why);
+  }
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), project: "" }), brake("bad_setting", /1 to 200 characters/));
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger: memoryLedger(), project: "a".repeat(201) }), brake("bad_setting", /1 to 200 characters/));
+});
+
+test("the ledger itself also refuses a name that is not a string, and reads each value once", async () => {
+  const ledger = memoryLedger();
+  await assert.rejects(ledger.reserve({ project: 5 as any, provider: "x", job: "j", usd: 0.1 }, () => {}), brake("bad_setting", /plain text/));
+  await assert.rejects(ledger.preview({ project: "p", provider: { length: 1 } as any, job: "j", usd: 0.1 }, () => {}), brake("bad_setting", /plain text/));
+  let reads = 0;
+  const e = { get project() { return reads++ === 0 ? "first" : "second"; }, provider: "x", job: "j", usd: 0.1 };
+  await ledger.reserve(e, () => {});
+  assert.equal(reads, 1);
+  assert.equal(ledger.rows[0].project, "first");
+});
+
+test("a missing or incomplete ledger is a clear bad_setting error", async () => {
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger: undefined as any }), brake("bad_setting", /ledger is required/));
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger: {} as any }), brake("bad_setting", /ledger is required/));
 });

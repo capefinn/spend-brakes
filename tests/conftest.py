@@ -1,6 +1,14 @@
 import pytest
 
+import spend_brakes.ledger as ledger_module
 from spend_brakes import Caps, Ledger, guarded_call
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ledger_settings(monkeypatch):
+    """Every test starts with no skip setting in the environment, and with no ledger file marked as already warned about."""
+    monkeypatch.delenv("SPEND_BRAKES_SKIP_UNREADABLE", raising=False)
+    ledger_module._WARNED_PATHS.clear()
 
 
 @pytest.fixture

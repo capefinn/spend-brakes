@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import warnings
 from pathlib import Path
 
 import pytest
@@ -124,9 +125,9 @@ def test_skipping_unreadable_lines_is_an_explicit_choice_and_the_skipped_spend_i
     with pytest.warns(UserWarning, match="NOT counted"):
         totals = ledger.totals("a")
     assert totals.month_usd == 0.10 and totals.unreadable_lines == 2
-    with pytest.warns(UserWarning):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the warning is shown once for this file: later reads are quiet
         reserve(ledger, 0.10)  # calls go on
-    with pytest.warns(UserWarning):
         assert ledger.month_total() == 0.20
 
 
@@ -140,6 +141,95 @@ def test_the_skip_choice_can_also_be_made_with_an_environment_variable(tmp_path,
 def test_an_unreadable_skip_setting_is_refused(tmp_path):
     with pytest.raises(ConfigError):
         Ledger.from_env({"SPEND_BRAKES_SKIP_UNREADABLE": "perhaps"})
+
+
+@pytest.mark.parametrize("value,expected", [("1", True), ("true", True), (" On ", True), ("YES", True), ("0", False), ("", False),
+                                            ("off", False), ("No", False)])
+def test_a_ledger_made_with_a_path_reads_the_skip_setting_like_the_typescript_fileledger(tmp_path, monkeypatch, value, expected):
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", value)
+    assert Ledger(tmp_path / "l.jsonl").skip_unreadable is expected
+    assert Ledger().skip_unreadable is expected  # the default path as well
+
+
+def test_a_ledger_made_with_a_path_is_strict_when_the_setting_is_not_set(tmp_path):
+    assert Ledger(tmp_path / "l.jsonl").skip_unreadable is False
+
+
+@pytest.mark.parametrize("value", ["maybe", "2", "enabled", "disabled", "y", "tru"])
+def test_a_ledger_made_with_a_path_refuses_an_unknown_skip_value(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", value)
+    with pytest.raises(ConfigError, match="SPEND_BRAKES_SKIP_UNREADABLE.*cannot be read. Use 1 or 0"):
+        Ledger(tmp_path / "l.jsonl")
+
+
+def test_an_explicit_skip_argument_wins_over_the_setting(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", "1")
+    assert Ledger(tmp_path / "l.jsonl", skip_unreadable=False).skip_unreadable is False
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", "0")
+    assert Ledger(tmp_path / "l.jsonl", skip_unreadable=True).skip_unreadable is True
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", "maybe")  # not read at all when the argument is given
+    assert Ledger(tmp_path / "l.jsonl", skip_unreadable=False).skip_unreadable is False
+
+
+def test_the_skip_setting_makes_a_damaged_ledger_usable_and_without_it_the_calls_stop(tmp_path, monkeypatch):
+    path = tmp_path / "l.jsonl"
+    reserve(Ledger(path), 0.10)
+    with open(path, "ab") as f:
+        f.write(b"this is not json\n")
+    with pytest.raises(LedgerUnreadable):
+        Ledger(path).month_total()
+    monkeypatch.setenv("SPEND_BRAKES_SKIP_UNREADABLE", "1")
+    with pytest.warns(UserWarning, match="NOT counted"):
+        assert Ledger(path).month_total() == 0.10
+
+
+# ---- the skip warning: once per program for each ledger file -----------------------------------------------------
+
+def test_the_skip_warning_is_shown_once_for_a_file_even_when_the_number_of_bad_lines_changes(tmp_path):
+    path = tmp_path / "l.jsonl"
+    path.write_text("garbage\n")
+    ledger = Ledger(path, skip_unreadable=True)
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            reserve(ledger, 0.01)
+        with open(path, "a") as f:
+            f.write("more garbage\n")  # now two bad lines
+        for _ in range(3):
+            reserve(ledger, 0.01)
+        Ledger(path, skip_unreadable=True).totals("a")  # another Ledger object for the same file
+    assert len(seen) == 1 and f"skipping 1 unreadable ledger line(s) in {path};" in str(seen[0].message)
+
+
+def test_the_skip_warning_is_shown_once_for_each_ledger_file(tmp_path):
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    first.write_text("garbage\n")
+    second.write_text("garbage\ngarbage\n")
+    clean = tmp_path / "c.jsonl"
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        Ledger(clean, skip_unreadable=True).totals("a")  # nothing to skip: no warning
+        for path in (first, second, first, second, first):
+            Ledger(path, skip_unreadable=True).totals("a")
+    assert [str(w.message) for w in seen] == [  # the message names the file, so two files give two different warnings
+        f"spend_brakes: skipping 1 unreadable ledger line(s) in {first}; their spend is NOT counted.",
+        f"spend_brakes: skipping 2 unreadable ledger line(s) in {second}; their spend is NOT counted.",
+    ]
+
+
+def test_two_ledger_files_with_the_same_number_of_bad_lines_both_warn_under_the_default_warning_filter(tmp_path):
+    """Python hides a repeated warning with the same text. The file name in the text keeps the second file visible."""
+    code = (
+        "import sys, warnings; sys.path.insert(0, %r)\n"
+        "from spend_brakes import Ledger\n"
+        "for name in ('a.jsonl', 'b.jsonl', 'a.jsonl'):\n"
+        "    Ledger(%r + '/' + name, skip_unreadable=True).totals('p')\n"
+    ) % (SRC, str(tmp_path))
+    (tmp_path / "a.jsonl").write_text("garbage\n")
+    (tmp_path / "b.jsonl").write_text("garbage\n")
+    result = subprocess.run([sys.executable, "-W", "default", "-c", code], capture_output=True, text=True)
+    lines = [line for line in result.stderr.splitlines() if "unreadable ledger line" in line and "UserWarning" in line]
+    assert result.returncode == 0 and len(lines) == 2 and "a.jsonl" in lines[0] and "b.jsonl" in lines[1]
 
 
 def test_a_row_cut_off_by_a_crash_is_reported_and_does_not_hide_the_next_row(tmp_path):

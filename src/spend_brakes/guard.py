@@ -9,9 +9,8 @@ import warnings
 from typing import Any, Callable, Mapping, Optional, TypeVar
 
 from .caps import (ENV_JOB_CALLS, ENV_MONTHLY, ENV_PROJECT_PREFIX, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, Caps,
-                   check_caps, check_estimate, check_money, env_word)
-from .errors import (ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached, NotRetried,
-                     ProjectCapReached, RetriesExhausted)
+                   check_caps, check_estimate, check_money, check_names, check_retries, env_word)
+from .errors import JobLimitReached, MonthlyCapReached, NotRetried, ProjectCapReached, RetriesExhausted
 from .killswitch import check_kill_switch
 from .ledger import Ledger, Totals
 
@@ -57,18 +56,16 @@ def _usd(x: float) -> str:
 
 
 def _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries, retry_delay_s, env):
-    """Check the arguments and build the brake check. guarded_call and check_call both use it, so both run the same brakes."""
+    """Check the arguments and build the brake check. guarded_call and check_call both use it, so both run the same brakes.
+
+    Every value that is compared with a cap or a ceiling is turned into a plain int or float here, after it is checked,
+    and only the plain value is used from then on. A subclass of int, float or str can change how it compares, so a
+    subclass never gets through: the names must be exactly of type str."""
     env = os.environ if env is None else env
+    check_names(project, provider, job)  # on every call, whether or not a cap is set
     estimate = check_estimate(estimate_usd)
-    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
-        raise ConfigError(f"max_retries must be a whole number from 0 to {HARD_MAX_RETRIES} (got {max_retries!r}).")
-    check_money(retry_delay_s, "retry_delay_s")
-    if max_retries > HARD_MAX_RETRIES:
-        raise HardCeilingExceeded(
-            f"max_retries={max_retries} is above the hard ceiling of {HARD_MAX_RETRIES}. The ceiling is written into the "
-            "code on purpose, so no setting can raise it. Only the owner can change it, in the code "
-            "(HARD_MAX_RETRIES in spend_brakes/caps.py), with a review."
-        )
+    max_retries = check_retries(max_retries)
+    retry_delay_s = check_money(retry_delay_s, "retry_delay_s")
     # Caps from any source are checked here, so a Caps made by a trick, or any other object, cannot switch a cap off.
     # The values are read once; `check` uses the checked copy only.
     caps = check_caps(caps if caps is not None else Caps.from_env(project, env))
@@ -76,27 +73,29 @@ def _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries, re
     ledger = ledger if ledger is not None else Ledger.from_env(env)
 
     def check(totals: Totals) -> None:
-        if totals.job_calls >= job_limit:
+        # The ledger gives the totals. They are made plain too, so a ledger of your own cannot change a comparison.
+        job_calls, project_usd, month_usd = int(totals.job_calls), float(totals.project_usd), float(totals.month_usd)
+        if job_calls >= job_limit:
             raise JobLimitReached(
-                f"Stopped by the job limit: job {job!r} already has {totals.job_calls} recorded calls (limit "
+                f"Stopped by the job limit: job {job!r} already has {job_calls} recorded calls (limit "
                 f"{job_limit}, refused calls count too). Look at why the job needs more calls. "
                 f"Ask the owner if the limit should change (setting: {ENV_JOB_CALLS}); the hard ceiling in the code "
                 "cannot be raised by a setting."
             )
-        if caps.project_usd is not None and round(totals.project_usd + estimate, 6) > caps.project_usd:
+        if caps.project_usd is not None and round(project_usd + estimate, 6) > caps.project_usd:
             raise ProjectCapReached(
-                f"Stopped by the project cap: project {project!r} spent {_usd(totals.project_usd)} this month, and this "
+                f"Stopped by the project cap: project {project!r} spent {_usd(project_usd)} this month, and this "
                 f"call is about {_usd(estimate)}, which would exceed the cap of {_usd(caps.project_usd)}. "
-                f"Ask the owner to raise it (setting: {ENV_PROJECT_PREFIX}{env_word(project)})."
+                f"Ask the owner to raise it (setting: {ENV_PROJECT_PREFIX}{env_word(project, 'project')})."
             )
-        if round(totals.month_usd + estimate, 6) > caps.monthly_usd:
+        if round(month_usd + estimate, 6) > caps.monthly_usd:
             raise MonthlyCapReached(
-                f"Stopped by the monthly cap: all projects spent {_usd(totals.month_usd)} this month, and this call is "
+                f"Stopped by the monthly cap: all projects spent {_usd(month_usd)} this month, and this call is "
                 f"about {_usd(estimate)}, which would exceed the cap of {_usd(caps.monthly_usd)}. "
                 f"Ask the owner to raise it (setting: {ENV_MONTHLY})."
             )
 
-    return env, estimate, ledger, check
+    return env, estimate, ledger, check, max_retries, retry_delay_s
 
 
 def _default_stop_file(ledger: Any) -> Optional[Any]:
@@ -129,8 +128,8 @@ def guarded_call(
     401, 402, 403 and 429 are never repeated. 5xx and timeouts are repeated at most `max_retries` times.
     `fn` must raise on HTTP errors, or return an object whose .status_code / .status is the HTTP status.
     """
-    env, estimate, ledger, check = _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries,
-                                            retry_delay_s, env)
+    env, estimate, ledger, check, max_retries, retry_delay_s = _prepare(
+        estimate_usd, project, provider, job, caps, ledger, max_retries, retry_delay_s, env)
 
     names = dict(project=project, provider=provider, job=job)
     attempt = 0
@@ -202,7 +201,7 @@ def check_call(
     checks the first attempt only. It does not call the provider. `cost_from_result` and `sleep` are accepted so
     that the same arguments work for both functions; they have no effect here.
     """
-    env, estimate, ledger, check = _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries,
-                                            retry_delay_s, env)
+    env, estimate, ledger, check, _retries, _delay = _prepare(
+        estimate_usd, project, provider, job, caps, ledger, max_retries, retry_delay_s, env)
     check_kill_switch(provider, env, _default_stop_file(ledger))
     ledger.preview(project=project, provider=provider, job=job, usd=estimate, check=check)
