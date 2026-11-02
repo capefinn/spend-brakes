@@ -3,6 +3,8 @@
   SPEND_PANIC=1                 stops every paid call
   SPEND_<PROVIDER>_ENABLED=0    stops one provider, e.g. SPEND_IMAGE_API_ENABLED=0
   SPEND_STOP_FILE=/some/path    if that file exists, every paid call stops (reaches processes that are already running)
+  a file named STOP             the default stop file: it sits in the same folder as the ledger file. SPEND_STOP_FILE,
+                                when it is set, replaces it. A ledger that is not a file has no default stop file.
 
 A value that cannot be read (for example "ofF!") counts as STOP. A brake must fail in the safe direction.
 """
@@ -17,6 +19,7 @@ from .errors import KillSwitchOn
 
 ENV_PANIC = "SPEND_PANIC"
 ENV_STOP_FILE = "SPEND_STOP_FILE"
+STOP_FILE_NAME = "STOP"  # the default stop file: this name, in the same folder as the ledger file
 _ON = {"1", "true", "on", "yes"}
 _OFF = {"0", "false", "off", "no"}
 
@@ -30,8 +33,12 @@ def _word(env: Mapping[str, str], name: str) -> Optional[str]:
     return raw or None
 
 
-def check_kill_switch(provider: str, env: Optional[Mapping[str, str]] = None) -> None:
-    """Raise KillSwitchOn when any switch says stop. Returns None when the call may go on."""
+def check_kill_switch(provider: str, env: Optional[Mapping[str, str]] = None,
+                      default_stop_file: Optional[os.PathLike] = None) -> None:
+    """Raise KillSwitchOn when any switch says stop. Returns None when the call may go on.
+
+    `default_stop_file` is used only when SPEND_STOP_FILE is not set. guarded_call passes the file named STOP
+    next to the ledger file."""
     env = os.environ if env is None else env
 
     panic = _word(env, ENV_PANIC)
@@ -47,10 +54,16 @@ def check_kill_switch(provider: str, env: Optional[Mapping[str, str]] = None) ->
         )
 
     stop_file = (env.get(ENV_STOP_FILE) or "").strip()
-    if stop_file and Path(stop_file).exists():
+    if stop_file:
+        if Path(stop_file).exists():
+            raise KillSwitchOn(
+                f"Stopped by the kill switch: the stop file named in {ENV_STOP_FILE} exists ({stop_file}). "
+                "Only the owner removes that file."
+            )
+    elif default_stop_file is not None and Path(default_stop_file).exists():
         raise KillSwitchOn(
-            f"Stopped by the kill switch: the stop file named in {ENV_STOP_FILE} exists ({stop_file}). "
-            "Only the owner removes that file."
+            f"Stopped by the kill switch: the default stop file exists ({default_stop_file}). It sits in the same "
+            f"folder as the ledger file. Only the owner removes that file (to use another file, set {ENV_STOP_FILE})."
         )
 
     name = provider_env_name(provider)

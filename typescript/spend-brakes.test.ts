@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkKillSwitch, fileLedger, guardedCall, makeCaps, memoryLedger, runId } from "./spend-brakes.js";
+import { BrakeError, HARD_MAX_CALLS_PER_JOB, HARD_MAX_RETRIES, capsFromEnv, checkCall, checkKillSwitch, fileLedger, guardedCall, makeCaps, memoryLedger, runId } from "./spend-brakes.js";
 import type { Ledger } from "./spend-brakes.js";
 
 const noSleep = async () => {};
@@ -307,4 +307,122 @@ test("a huge whole number in the ledger is an unreadable line, not a crash or a 
   writeFileSync(path, JSON.stringify(goodRow(thisMonth(), { usd: 0.1 })) + "\n" + `{"event":"reserve","id":"big","project":"a","job":"j","t":"${thisMonth()}-01T00:00:00Z","usd":1${"0".repeat(400)}}\n`);
   await assert.rejects(guardedCall(fn, { ...base, ledger: fileLedger(path) }), brake("ledger_unreadable", /line 2/));
   assert.equal(fn.calls, 0);
+});
+
+// ---- the message of retries_exhausted --------------------------------------------------------------------------
+
+test("the retries message says maxRetries is an option, not a setting, and names the ceiling", async () => {
+  await assert.rejects(guardedCall(script(httpError(503)), { ...base, ledger: memoryLedger(), maxRetries: 1 }), (e: unknown) => {
+    assert.ok(e instanceof BrakeError && e.brake === "retries_exhausted");
+    assert.ok(!e.message.includes("setting: maxRetries"), "maxRetries is not an environment setting");
+    assert.match(e.message, /the maxRetries option of guardedCall/);
+    assert.match(e.message, /not an environment setting/);
+    assert.match(e.message, new RegExp(`the ceiling is ${HARD_MAX_RETRIES}`));
+    return true;
+  });
+});
+
+// ---- the default stop file: a file named STOP in the same folder as the ledger file ----------------------------
+
+test("a file ledger has a default stop file named STOP next to it; a memory ledger has none", () => {
+  const path = tmpFile();
+  assert.equal(fileLedger(path).stopFile, join(dirname(path), "STOP"));
+  assert.equal(fileLedger(join(dirname(path), "deep", "other-name.jsonl")).stopFile, join(dirname(path), "deep", "STOP"));
+  assert.equal(memoryLedger().stopFile, undefined);
+});
+
+test("the default stop file stops calls with no setting at all, and a memory ledger ignores it", async () => {
+  const path = tmpFile(), ledger = fileLedger(path), fn = script("ok"), stopFile = join(dirname(path), "STOP");
+  await guardedCall(fn, { ...base, ledger }); // env is {}: no SPEND_STOP_FILE anywhere
+  writeFileSync(stopFile, "");
+  const before = readFileSync(path, "utf8");
+  await assert.rejects(guardedCall(fn, { ...base, ledger }), (e: unknown) => brake("kill_switch")(e) && [`the default stop file exists (${stopFile})`, "owner removes that file", "SPEND_STOP_FILE"].every((t) => (e as Error).message.includes(t)));
+  assert.equal(fn.calls, 1); // the stopped call never ran
+  assert.equal(readFileSync(path, "utf8"), before); // and wrote nothing
+  await guardedCall(script("ok"), { ...base, ledger: memoryLedger() }); // a ledger that is not a file has no default stop file
+  rmSync(stopFile);
+  await guardedCall(fn, { ...base, ledger });
+  assert.equal(fn.calls, 2);
+});
+
+test("a stop file in another folder does not stop calls, and the default stop file also stops a retry", async () => {
+  const path = tmpFile(), other = tmpFile();
+  writeFileSync(join(dirname(other), "STOP"), "");
+  await guardedCall(script("ok"), { ...base, ledger: fileLedger(path) });
+  const flaky = async () => { writeFileSync(join(dirname(path), "STOP"), ""); throw httpError(503); };
+  await assert.rejects(guardedCall(flaky, { ...base, ledger: fileLedger(path), maxRetries: 3 }), brake("kill_switch"));
+});
+
+test("SPEND_STOP_FILE replaces the default stop file", async () => {
+  const path = tmpFile(), ledger = fileLedger(path), mine = join(dirname(path), "my-own-stop-file");
+  writeFileSync(join(dirname(path), "STOP"), "");
+  await guardedCall(script("ok"), { ...base, ledger, env: { SPEND_STOP_FILE: mine } }); // the named file does not exist: go
+  writeFileSync(mine, "");
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger, env: { SPEND_STOP_FILE: mine } }), brake("kill_switch", /named in SPEND_STOP_FILE/));
+  await assert.rejects(guardedCall(script("ok"), { ...base, ledger }), brake("kill_switch", /default stop file/)); // no setting: the default applies again
+  assert.doesNotThrow(() => checkKillSwitch("image_api", { SPEND_STOP_FILE: join(dirname(path), "nothing") }, mine));
+  assert.throws(() => checkKillSwitch("image_api", { SPEND_STOP_FILE: "   " }, mine), brake("kill_switch")); // an empty setting is the same as no setting
+});
+
+// ---- checkCall: the read-only "would this call be allowed?" check ----------------------------------------------
+
+const listing = (folder: string) => readdirSync(folder).map((n) => `${n}:${readFileSync(join(folder, n), "utf8").length}`).sort();
+
+test("checkCall: an allowed call returns and writes nothing, not even a folder; it never uses up the job limit", async () => {
+  const folder = join(mkdtempSync(join(tmpdir(), "sb-")), "fresh-folder");
+  const ledger = fileLedger(join(folder, "ledger.jsonl"));
+  assert.equal(await checkCall({ ...base, ledger }), undefined);
+  assert.ok(!existsSync(folder));
+
+  const memory = memoryLedger(), caps = makeCaps({ monthlyUsd: 100, maxCallsPerJob: 2 });
+  for (let i = 0; i < 5; i++) await checkCall({ ...base, ledger: memory, caps });
+  assert.equal(memory.rows.length, 0);
+  await guardedCall(script("ok"), { ...base, ledger: memory, caps });
+  await guardedCall(script("ok"), { ...base, ledger: memory, caps });
+  await assert.rejects(checkCall({ ...base, ledger: memory, caps }), brake("job_limit", /limit 2/));
+});
+
+test("checkCall raises the same error with the same message as a real call, for every brake, and writes nothing", async () => {
+  const used = async (runs: number) => {
+    const path = tmpFile(), ledger = fileLedger(path);
+    for (let i = 0; i < runs; i++) await guardedCall(script("ok"), { ...base, ledger });
+    return { path, ledger };
+  };
+  const scenarios: Array<[string, () => Promise<{ path: string; opts: any }>]> = [
+    ["kill_switch", async () => { const u = await used(0); return { path: u.path, opts: { ledger: u.ledger, env: { SPEND_PANIC: "1" } } }; }],
+    ["kill_switch", async () => { const u = await used(0); return { path: u.path, opts: { ledger: u.ledger, env: { SPEND_IMAGE_API_ENABLED: "0" } } }; }],
+    ["kill_switch", async () => { const u = await used(0); writeFileSync(join(dirname(u.path), "STOP"), ""); return { path: u.path, opts: { ledger: u.ledger } }; }],
+    ["job_limit", async () => { const u = await used(2); return { path: u.path, opts: { ledger: u.ledger, caps: makeCaps({ monthlyUsd: 100, maxCallsPerJob: 2 }) } }; }],
+    ["project_cap", async () => { const u = await used(2); return { path: u.path, opts: { ledger: u.ledger, job: "job-2", caps: makeCaps({ monthlyUsd: 100, projectUsd: 0.25 }) } }; }],
+    ["monthly_cap", async () => { const u = await used(2); return { path: u.path, opts: { ledger: u.ledger, job: "job-2", caps: makeCaps({ monthlyUsd: 0.25 }) } }; }],
+    ["ledger_unreadable", async () => { const u = await used(1); writeFileSync(u.path, readFileSync(u.path, "utf8") + "this line is not a ledger row\n"); return { path: u.path, opts: { ledger: u.ledger } }; }],
+    ["hard_ceiling", async () => { const u = await used(0); return { path: u.path, opts: { ledger: u.ledger, maxRetries: 4 } }; }],
+    ["bad_setting", async () => { const u = await used(0); return { path: u.path, opts: { ledger: u.ledger, estimateUsd: Number.NaN } }; }],
+    ["bad_setting", async () => { const u = await used(0); return { path: u.path, opts: { ledger: u.ledger, job: "" } }; }],
+  ];
+  for (const [name, build] of scenarios) {
+    const { path, opts } = await build();
+    const before = listing(dirname(path));
+    const dry = await checkCall({ ...base, ...opts }).then(() => assert.fail(`checkCall did not stop: ${name}`), (e: unknown) => e);
+    assert.deepEqual(listing(dirname(path)), before); // a refusal writes nothing either
+    const fn = script("ok");
+    const real = await guardedCall(fn, { ...base, ...opts }).then(() => assert.fail(`guardedCall did not stop: ${name}`), (e: unknown) => e);
+    assert.equal(fn.calls, 0); // the real call was stopped too
+    assert.ok(dry instanceof BrakeError && real instanceof BrakeError, name);
+    assert.equal((dry as BrakeError).brake, name);
+    assert.equal((dry as BrakeError).brake, (real as BrakeError).brake);
+    assert.equal((dry as BrakeError).message, (real as BrakeError).message);
+  }
+});
+
+test("checkCall takes the same options as guardedCall and reads the environment settings like it", async () => {
+  const ledger = memoryLedger();
+  const same = { ...base, ledger, maxRetries: 2, retryDelayMs: 0, costFromResult: () => 0.01 };
+  await checkCall(same);
+  assert.equal(await guardedCall(script("ok"), same), "ok");
+  const env: Record<string, string> = { SPEND_MONTHLY_CAP_USD: "0.05" }; // below the estimate
+  const open = { estimateUsd: 0.1, project: "p", provider: "image_api", job: "j", ledger: memoryLedger(), env };
+  await assert.rejects(checkCall(open), brake("monthly_cap", /SPEND_MONTHLY_CAP_USD/));
+  env.SPEND_MONTHLY_CAP_USD = "5";
+  await checkCall(open);
 });

@@ -235,3 +235,11 @@ def test_only_the_https_proxy_of_the_environment_is_used(proxy_env):
     handlers = [h for h in httpjson_module._opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
     assert len(handlers) == 1 and handlers[0].proxies == {"https": "http://proxy-three.invalid:3128"}
     assert not hasattr(handlers[0], "http_open")  # a ProxyHandler for http would have this method
+
+
+def test_http_status_error_is_exported_from_the_package_root():
+    import spend_brakes
+    from spend_brakes import HttpStatusError as from_root
+    assert from_root is HttpStatusError
+    assert "HttpStatusError" in spend_brakes.__all__
+    assert from_root(402, "no money").status == 402

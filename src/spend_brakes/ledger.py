@@ -34,6 +34,7 @@ from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from .caps import check_money
 from .errors import ConfigError, LedgerUnreadable
+from .killswitch import STOP_FILE_NAME
 
 try:  # POSIX only
     import fcntl
@@ -70,6 +71,12 @@ def _skip_from_env(env: Mapping[str, str]) -> bool:
     raise ConfigError(f"{ENV_SKIP_UNREADABLE}={raw!r} cannot be read. Use 1 or 0.")
 
 
+def check_names(project: str, provider: str, job: str) -> None:
+    for label, value in (("project", project), ("provider", provider), ("job", job)):
+        if not isinstance(value, str) or not value or len(value) > MAX_NAME_LENGTH:
+            raise ConfigError(f"{label} must be a name of 1 to {MAX_NAME_LENGTH} characters.")
+
+
 def run_id() -> str:
     """A new id for every run of a script, to use inside a job name: job="batch-" + run_id()."""
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
@@ -88,14 +95,17 @@ class Ledger:
         env = os.environ if env is None else env
         return cls(default_path(env), skip_unreadable=_skip_from_env(env))
 
+    @property
+    def stop_file(self) -> Path:
+        """The default stop file: a file named STOP in the same folder as the ledger file."""
+        return self.path.parent / STOP_FILE_NAME
+
     # ---- writing -------------------------------------------------------------------------------------------
 
     def reserve(self, *, project: str, provider: str, job: str, usd: float,
                 check: Callable[[Totals], None]) -> str:
         """Under the lock: read the totals, let `check` refuse (it raises), then write the reserve row."""
-        for label, value in (("project", project), ("provider", provider), ("job", job)):
-            if not isinstance(value, str) or not value or len(value) > MAX_NAME_LENGTH:
-                raise ConfigError(f"{label} must be a name of 1 to {MAX_NAME_LENGTH} characters.")
+        check_names(project, provider, job)
         check_money(usd, "estimate_usd")
         with self._locked():
             rows, bad = self._read_rows()
@@ -105,6 +115,15 @@ class Ledger:
             self._append({"event": "reserve", "id": call_id, "project": project, "provider": provider,
                           "job": job, "usd": usd})
             return call_id
+
+    def preview(self, *, project: str, provider: str, job: str, usd: float, check: Callable[[Totals], None]) -> None:
+        """The read-only twin of `reserve`: the same name check, the same rule for unreadable lines and the same `check`
+        (it raises to refuse), but nothing is written. No lock is taken, and no file or folder is made."""
+        check_names(project, provider, job)
+        check_money(usd, "estimate_usd")
+        rows, bad = self._read_rows()
+        self._require_readable(bad)
+        check(self._totals(rows, len(bad), project, job))
 
     def settle(self, call_id: str, *, project: str, provider: str, job: str, usd: float, outcome: str) -> None:
         """Write the final cost of a call. `outcome` is ok, rejected or error."""

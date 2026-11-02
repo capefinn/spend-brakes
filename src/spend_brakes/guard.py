@@ -56,31 +56,8 @@ def _usd(x: float) -> str:
     return f"${x:,.2f}" if x == 0 or x >= 0.01 else f"${x:.4f}"
 
 
-def guarded_call(
-    fn: Callable[[], T],
-    *,
-    estimate_usd: float,
-    project: str,
-    provider: str,
-    job: str,
-    caps: Optional[Caps] = None,
-    ledger: Optional[Ledger] = None,
-    max_retries: int = 1,
-    retry_delay_s: float = 2.0,
-    cost_from_result: Optional[Callable[[Any], float]] = None,
-    env: Optional[Mapping[str, str]] = None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> T:
-    """Call `fn()` (no arguments; use a lambda) after the brakes agree.
-
-    `job` is required and must be NEW for every run of your script (for example "batch-" + run_id()). The job limit
-    counts every call ever recorded under the same project + job, so a name that is used again keeps its old count.
-
-    Before every attempt, retries included: kill switch, job limit, project cap, monthly cap. The estimate is
-    written to the ledger before `fn` runs. After it: the real cost (from `cost_from_result`) or the estimate.
-    401, 402, 403 and 429 are never repeated. 5xx and timeouts are repeated at most `max_retries` times.
-    `fn` must raise on HTTP errors, or return an object whose .status_code / .status is the HTTP status.
-    """
+def _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries, retry_delay_s, env):
+    """Check the arguments and build the brake check. guarded_call and check_call both use it, so both run the same brakes."""
     env = os.environ if env is None else env
     estimate = check_estimate(estimate_usd)
     if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
@@ -116,11 +93,47 @@ def guarded_call(
                 f"Ask the owner to raise it (setting: {ENV_MONTHLY})."
             )
 
+    return env, estimate, ledger, check
+
+
+def _default_stop_file(ledger: Any) -> Optional[Any]:
+    """The file named STOP next to the ledger file. A ledger that has no such file (not a file ledger) gives None."""
+    return getattr(ledger, "stop_file", None)
+
+
+def guarded_call(
+    fn: Callable[[], T],
+    *,
+    estimate_usd: float,
+    project: str,
+    provider: str,
+    job: str,
+    caps: Optional[Caps] = None,
+    ledger: Optional[Ledger] = None,
+    max_retries: int = 1,
+    retry_delay_s: float = 2.0,
+    cost_from_result: Optional[Callable[[Any], float]] = None,
+    env: Optional[Mapping[str, str]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Call `fn()` (no arguments; use a lambda) after the brakes agree.
+
+    `job` is required and must be NEW for every run of your script (for example "batch-" + run_id()). The job limit
+    counts every call ever recorded under the same project + job, so a name that is used again keeps its old count.
+
+    Before every attempt, retries included: kill switch, job limit, project cap, monthly cap. The estimate is
+    written to the ledger before `fn` runs. After it: the real cost (from `cost_from_result`) or the estimate.
+    401, 402, 403 and 429 are never repeated. 5xx and timeouts are repeated at most `max_retries` times.
+    `fn` must raise on HTTP errors, or return an object whose .status_code / .status is the HTTP status.
+    """
+    env, estimate, ledger, check = _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries,
+                                            retry_delay_s, env)
+
     names = dict(project=project, provider=provider, job=job)
     attempt = 0
     while True:
         attempt += 1
-        check_kill_switch(provider, env)
+        check_kill_switch(provider, env, _default_stop_file(ledger))
         call_id = ledger.reserve(usd=estimate, check=check, **names)  # the estimate is on record before the call
         try:
             result = fn()
@@ -144,7 +157,8 @@ def guarded_call(
                     attempt,
                     f"Gave up after {attempt} attempt(s): the provider kept answering with a server error or a timeout. "
                     "Every attempt is counted in the ledger as a possible cost. Check the provider's status before you "
-                    f"run it again. More tries are the owner's choice (setting: max_retries; highest allowed: {HARD_MAX_RETRIES}).",
+                    "run it again. More tries are the owner's choice: raise the max_retries argument of guarded_call "
+                    f"(it is an argument, not an environment setting; the ceiling is {HARD_MAX_RETRIES}).",
                 ) from exc
             sleep(retry_delay_s * attempt)
             continue
@@ -159,3 +173,33 @@ def guarded_call(
         except OSError as err:  # the estimate is already on record; do not lose a paid result over a failed note
             warnings.warn(f"spend_brakes: could not write the final cost to the ledger ({err}); the estimate stays.")
         return result
+
+
+def check_call(
+    *,
+    estimate_usd: float,
+    project: str,
+    provider: str,
+    job: str,
+    caps: Optional[Caps] = None,
+    ledger: Optional[Ledger] = None,
+    max_retries: int = 1,
+    retry_delay_s: float = 2.0,
+    cost_from_result: Optional[Callable[[Any], float]] = None,
+    env: Optional[Mapping[str, str]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Ask: would `guarded_call` allow this call now? Read-only. Use it for a --dry-run.
+
+    It takes the same keyword arguments as `guarded_call`, without the function, and runs the same brakes in the same
+    order: the arguments, the kill switch, the job limit, the project cap and the monthly cap. When a brake would stop
+    the call, it raises the same error with the same message. When all brakes agree, it returns None.
+
+    It writes nothing: no row in the ledger (so it never counts for the job limit), no lock file, no folder. It
+    checks the first attempt only. It does not call the provider. `cost_from_result` and `sleep` are accepted so
+    that the same arguments work for both functions; they have no effect here.
+    """
+    env, estimate, ledger, check = _prepare(estimate_usd, project, provider, job, caps, ledger, max_retries,
+                                            retry_delay_s, env)
+    check_kill_switch(provider, env, _default_stop_file(ledger))
+    ledger.preview(project=project, provider=provider, job=job, usd=estimate, check=check)

@@ -2,7 +2,7 @@
 // Same five brakes and the same ledger row format as the Python package, so both can share one ledger file.
 // Brakes, checked before EVERY attempt: kill switch, job limit, project cap, monthly cap. Then the retry rules.
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 // Part of the code on purpose: no argument and no environment variable can raise these two numbers.
 export const HARD_MAX_CALLS_PER_JOB = 20;
@@ -67,8 +67,10 @@ export function capsFromEnv(project: string, env: Env = process.env): Caps {
 
 // ---- kill switch ----------------------------------------------------------------------------------------------
 // SPEND_PANIC=1 stops everything. SPEND_<PROVIDER>_ENABLED=0 stops one provider. If the file named in
-// SPEND_STOP_FILE exists, everything stops. A value that cannot be read counts as STOP (the safe choice).
-export function checkKillSwitch(provider: string, env: Env = process.env): void {
+// SPEND_STOP_FILE exists, everything stops. When SPEND_STOP_FILE is not set, `defaultStopFile` is used: for a file
+// ledger it is a file named STOP in the same folder as the ledger file (a ledger that is not a file has none).
+// A value that cannot be read counts as STOP (the safe choice).
+export function checkKillSwitch(provider: string, env: Env = process.env, defaultStopFile?: string): void {
   const stop = (m: string) => { throw new BrakeError("kill_switch", `Stopped by the kill switch: ${m}`); };
   const word = (name: string) => (env[name] ?? "").trim().toLowerCase();
   const ON = ["1", "true", "on", "yes"], OFF = ["0", "false", "off", "no"];
@@ -78,7 +80,11 @@ export function checkKillSwitch(provider: string, env: Env = process.env): void 
   if (panic && !OFF.includes(panic)) stop(`SPEND_PANIC="${panic}" cannot be read, so it counts as ON (the safe choice). Ask the owner to fix the value (setting: SPEND_PANIC; 1 means stop, 0 means go).`);
 
   const file = (env.SPEND_STOP_FILE ?? "").trim();
-  if (file && existsSync(file)) stop(`the stop file named in SPEND_STOP_FILE exists (${file}). Only the owner removes that file.`);
+  if (file) {
+    if (existsSync(file)) stop(`the stop file named in SPEND_STOP_FILE exists (${file}). Only the owner removes that file.`);
+  } else if (defaultStopFile && existsSync(defaultStopFile)) {
+    stop(`the default stop file exists (${defaultStopFile}). It sits in the same folder as the ledger file. Only the owner removes that file (to use another file, set SPEND_STOP_FILE).`);
+  }
 
   const name = `SPEND_${envWord(provider)}_ENABLED`, value = word(name);
   if (!value || ON.includes(value)) return;
@@ -95,6 +101,10 @@ export interface Ledger {
   /** Must be atomic: read the totals, let `check` throw to refuse, then record the estimate. Returns the call id. */
   reserve(e: { project: string; provider: string; job: string; usd: number }, check: (t: Totals) => void): Promise<string>;
   settle(e: { id: string; project: string; provider: string; job: string; usd: number; outcome: "ok" | "rejected" | "error" }): Promise<void>;
+  /** The read-only twin of `reserve`, used by `checkCall`: read the totals and let `check` throw to refuse. Write nothing. */
+  preview(e: { project: string; provider: string; job: string; usd: number }, check: (t: Totals) => void): Promise<void>;
+  /** The default stop file: a file named STOP in the same folder as the ledger file. Only a file ledger has one. */
+  readonly stopFile?: string;
 }
 
 // A row we can count with: every field the totals use must be there and make sense.
@@ -104,6 +114,10 @@ const rowOk = (r: any): r is Row => !!r && typeof r === "object" && !Array.isArr
 
 /** A new id for every run of a script, to use inside a job name: job: "batch-" + runId(). */
 export const runId = (): string => new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z") + "-" + globalThis.crypto.randomUUID().slice(0, 6);
+
+function checkNames(e: { project: string; provider: string; job: string }): void {
+  for (const [label, v] of [["project", e.project], ["provider", e.provider], ["job", e.job]]) if (!v || v.length > 200) throw new BrakeError("bad_setting", `${label} must be a name of 1 to 200 characters.`);
+}
 
 function totalsOf(rows: Row[], project: string, job: string, month: string): Totals {
   const calls = new Map<string, { month: string; project: string; job: string; usd: number }>();
@@ -125,7 +139,7 @@ function totalsOf(rows: Row[], project: string, job: string, month: string): Tot
 function rowsLedger(store: { read(): Row[]; append(row: Row): void }, now: () => Date): Ledger {
   return {
     reserve: async (e, check) => {
-      for (const [label, v] of [["project", e.project], ["provider", e.provider], ["job", e.job]]) if (!v || v.length > 200) throw new BrakeError("bad_setting", `${label} must be a name of 1 to 200 characters.`);
+      checkNames(e);
       money(e.usd, "estimateUsd");
       check(totalsOf(store.read(), e.project, e.job, now().toISOString().slice(0, 7)));
       const id = globalThis.crypto.randomUUID().replace(/-/g, "");
@@ -133,6 +147,12 @@ function rowsLedger(store: { read(): Row[]; append(row: Row): void }, now: () =>
       return id;
     },
     settle: async (e) => store.append({ t: now().toISOString(), event: "settle", ...e }),
+    // Read only: the same name check, the same rule for unreadable lines and the same `check`, but nothing is written.
+    preview: async (e, check) => {
+      checkNames(e);
+      money(e.usd, "estimateUsd");
+      check(totalsOf(store.read(), e.project, e.job, now().toISOString().slice(0, 7)));
+    },
   };
 }
 
@@ -146,7 +166,8 @@ export function memoryLedger(now: () => Date = () => new Date()): Ledger & { row
  *  inside one process only; for several processes or servers, write a Ledger over a database transaction instead.
  *  A line that cannot be read means the real spend is not known, so by default every call is REFUSED (ledger_unreadable)
  *  until the owner repairs the file. Skipping such lines is an explicit choice: { skipUnreadable: true } or
- *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never hidden. */
+ *  SPEND_BRAKES_SKIP_UNREADABLE=1. A row after a cut-off line starts on a new line, so it is never hidden.
+ *  A file named STOP in the same folder as the ledger file is the default stop file (SPEND_STOP_FILE replaces it). */
 export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadable?: boolean } = {}): Ledger {
   const skip = opts.skipUnreadable ?? ["1", "true", "on", "yes"].includes((process.env.SPEND_BRAKES_SKIP_UNREADABLE ?? "").trim().toLowerCase());
   const read = (): Row[] => {
@@ -170,7 +191,7 @@ export function fileLedger(path: string, opts: { now?: () => Date; skipUnreadabl
     }
     appendFileSync(path, line, { mode: 0o600 });
   };
-  return rowsLedger({ read, append }, opts.now ?? (() => new Date()));
+  return { ...rowsLedger({ read, append }, opts.now ?? (() => new Date())), stopFile: join(dirname(path), "STOP") };
 }
 
 // ---- guarded call ---------------------------------------------------------------------------------------------
@@ -199,25 +220,31 @@ export interface CallOptions {
   env?: Env; sleep?: (ms: number) => Promise<void>;
 }
 
-/** Run `fn` only after every brake agrees. `fn` must throw on HTTP errors, or return an object with .status (fetch does). */
-export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Promise<T> {
+// Check the options and build the brake check. guardedCall and checkCall both use it, so both run the same brakes.
+function prepare(o: CallOptions) {
   const env = o.env ?? process.env, job = o.job, maxRetries = o.maxRetries ?? 1;
   if (typeof job !== "string" || !job) throw new BrakeError("bad_setting", "job is required: a name that is new for every run of your script, for example \"batch-\" + runId().");
   const estimate = money(o.estimateUsd, "estimateUsd");
   if (!Number.isInteger(maxRetries) || maxRetries < 0) throw new BrakeError("bad_setting", `maxRetries must be a whole number from 0 to ${HARD_MAX_RETRIES} (got ${String(maxRetries)}).`);
   if (maxRetries > HARD_MAX_RETRIES) throw new BrakeError("hard_ceiling", `maxRetries=${maxRetries} is above the hard ceiling of ${HARD_MAX_RETRIES}. The ceiling is written into the code on purpose, so no setting can raise it. Only the owner can change it, in the code (HARD_MAX_RETRIES in this file), with a review.`);
   const caps = o.caps ?? capsFromEnv(o.project, env);
-  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const names = { project: o.project, provider: o.provider, job };
 
   const check = (t: Totals) => {
     if (t.jobCalls >= caps.maxCallsPerJob) throw new BrakeError("job_limit", `Stopped by the job limit: job "${job}" already has ${t.jobCalls} recorded calls (limit ${caps.maxCallsPerJob}, refused calls count too). Look at why the job needs more calls. Ask the owner if the limit should change (setting: SPEND_MAX_CALLS_PER_JOB); the hard ceiling in the code cannot be raised by a setting.`);
     if (caps.projectUsd !== undefined && round6(t.projectUsd + estimate) > caps.projectUsd) throw new BrakeError("project_cap", `Stopped by the project cap: project "${o.project}" spent ${usd(t.projectUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.projectUsd)}. Ask the owner to raise it (setting: SPEND_PROJECT_CAP_USD_${envWord(o.project)}).`);
     if (round6(t.monthUsd + estimate) > caps.monthlyUsd) throw new BrakeError("monthly_cap", `Stopped by the monthly cap: all projects spent ${usd(t.monthUsd)} this month, and this call is about ${usd(estimate)}, which would exceed the cap of ${usd(caps.monthlyUsd)}. Ask the owner to raise it (setting: SPEND_MONTHLY_CAP_USD).`);
   };
+  return { env, job, estimate, maxRetries, check };
+}
+
+/** Run `fn` only after every brake agrees. `fn` must throw on HTTP errors, or return an object with .status (fetch does). */
+export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Promise<T> {
+  const { env, job, estimate, maxRetries, check } = prepare(o);
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const names = { project: o.project, provider: o.provider, job };
 
   for (let attempt = 1; ; attempt++) {
-    checkKillSwitch(o.provider, env);
+    checkKillSwitch(o.provider, env, o.ledger.stopFile);
     const id = await o.ledger.reserve({ ...names, usd: estimate }, check); // the estimate is on record before the call
     let result: T;
     try {
@@ -232,7 +259,7 @@ export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Prom
       }
       await o.ledger.settle({ id, ...names, usd: estimate, outcome: "error" }); // may have been billed: keep the estimate
       if (!isTransient(error)) throw error;
-      if (attempt > maxRetries) throw new BrakeError("retries_exhausted", `Gave up after ${attempt} attempt(s): the provider kept answering with a server error or a timeout. Every attempt is counted in the ledger as a possible cost. Check the provider's status before you run it again. More tries are the owner's choice (setting: maxRetries; highest allowed: ${HARD_MAX_RETRIES}).`, { cause: error });
+      if (attempt > maxRetries) throw new BrakeError("retries_exhausted", `Gave up after ${attempt} attempt(s): the provider kept answering with a server error or a timeout. Every attempt is counted in the ledger as a possible cost. Check the provider's status before you run it again. More tries are the owner's choice: raise the maxRetries option of guardedCall (it is an option, not an environment setting; the ceiling is ${HARD_MAX_RETRIES}).`, { cause: error });
       await sleep((o.retryDelayMs ?? 2_000) * attempt);
       continue;
     }
@@ -241,4 +268,17 @@ export async function guardedCall<T>(fn: () => Promise<T>, o: CallOptions): Prom
     await o.ledger.settle({ id, ...names, usd: cost, outcome: "ok" }).catch(() => undefined); // the estimate is already on record
     return result;
   }
+}
+
+/** Ask: would `guardedCall` allow this call now? Read-only. Use it for a --dry-run.
+ *  It takes the same options as `guardedCall` (without the function) and runs the same brakes in the same order: the
+ *  options, the kill switch, the job limit, the project cap and the monthly cap. When a brake would stop the call it
+ *  throws the same BrakeError with the same message. When all brakes agree it returns.
+ *  It writes nothing: no row in the ledger (so it never counts for the job limit). It checks the first attempt only.
+ *  It does not call the provider. `costFromResult`, `sleep` and `retryDelayMs` are accepted so that the same options
+ *  work for both functions; they have no effect here. */
+export async function checkCall(o: CallOptions): Promise<void> {
+  const { env, job, estimate, check } = prepare(o);
+  checkKillSwitch(o.provider, env, o.ledger.stopFile);
+  await o.ledger.preview({ project: o.project, provider: o.provider, job, usd: estimate }, check);
 }

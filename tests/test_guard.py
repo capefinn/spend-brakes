@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from spend_brakes import (BrakeError, Caps, ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached,
+from spend_brakes import (HARD_MAX_RETRIES, BrakeError, Caps, ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached,
                           NotRetried, ProjectCapReached, RetriesExhausted, guarded_call, run_id)
 from spend_brakes.httpjson import HttpStatusError
 from helpers import FakeHttpError, Script
@@ -174,6 +174,16 @@ def test_server_errors_and_timeouts_are_retried_a_bounded_number_of_times(call, 
     assert len(sleeps) == 2
     assert ledger.month_total() == 0.30  # a failed attempt may still be billed, so each stays on record
     assert "max_retries" in str(stop.value)
+
+
+def test_the_retries_message_says_max_retries_is_an_argument_not_a_setting(call):
+    with pytest.raises(RetriesExhausted) as stop:
+        call(Script(HttpStatusError(503)), max_retries=1)
+    message = str(stop.value)
+    assert "setting: max_retries" not in message  # max_retries is not an environment setting
+    assert "the max_retries argument of guarded_call" in message
+    assert "not an environment setting" in message
+    assert f"the ceiling is {HARD_MAX_RETRIES}" in message
 
 
 def test_one_retry_is_the_default(call):
