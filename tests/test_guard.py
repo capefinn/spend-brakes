@@ -1,0 +1,341 @@
+import re
+import socket
+import urllib.error
+
+import pytest
+
+from spend_brakes import (HARD_MAX_RETRIES, BrakeError, Caps, ConfigError, HardCeilingExceeded, JobLimitReached, MonthlyCapReached,
+                          NotRetried, ProjectCapReached, RetriesExhausted, guarded_call, run_id)
+from spend_brakes.httpjson import HttpStatusError
+from helpers import FakeHttpError, Script
+
+
+# ---- recording ------------------------------------------------------------------------------------------------
+
+def test_the_estimate_is_on_record_before_the_call_runs(call, ledger):
+    seen = {}
+
+    def fn():
+        seen["rows"] = ledger.rows()
+        return "done"
+
+    assert call(fn, estimate_usd=0.25) == "done"
+    assert [r["event"] for r in seen["rows"]] == ["reserve"] and seen["rows"][0]["usd"] == 0.25
+    assert [r["event"] for r in ledger.rows()] == ["reserve", "settle"]
+
+
+def test_the_real_cost_replaces_the_estimate(call, ledger):
+    call(Script({"cost": 0.03}), estimate_usd=0.25, cost_from_result=lambda r: r["cost"])
+    assert ledger.month_total() == 0.03
+
+
+@pytest.mark.parametrize("reader", [lambda r: 1 / 0, lambda r: -4.0, lambda r: float("nan")])
+def test_a_broken_cost_reader_falls_back_to_the_estimate_and_keeps_the_result(call, ledger, reader):
+    assert call(Script("ok"), estimate_usd=0.25, cost_from_result=reader) == "ok"
+    assert ledger.month_total() == 0.25
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.01, "0.1", None])
+def test_a_bad_estimate_stops_before_anything_is_written(call, ledger, bad):
+    fn = Script("ok")
+    with pytest.raises(ConfigError):
+        call(fn, estimate_usd=bad)
+    assert fn.calls == 0 and not ledger.path.exists()
+
+
+# ---- the money caps --------------------------------------------------------------------------------------------
+
+def test_monthly_cap_stops_the_call_that_would_exceed_it(call, ledger):
+    caps = Caps(monthly_usd=0.25)
+    fn = Script("ok")
+    call(fn, caps=caps)
+    call(fn, caps=caps)
+    with pytest.raises(MonthlyCapReached) as stop:
+        call(fn, caps=caps)
+    assert fn.calls == 2  # the third call never ran
+    assert stop.value.brake == "monthly_cap"
+    assert "SPEND_MONTHLY_CAP_USD" in str(stop.value) and "Ask the owner to raise it" in str(stop.value)
+    assert ledger.month_total() == 0.20
+
+
+def test_a_call_that_reaches_exactly_the_cap_is_allowed_the_next_is_not(call):
+    caps, fn = Caps(monthly_usd=0.30), Script("ok")
+    for _ in range(3):
+        call(fn, caps=caps)
+    with pytest.raises(MonthlyCapReached):
+        call(fn, caps=caps)
+
+
+def test_the_monthly_cap_is_shared_by_every_project(call):
+    caps = Caps(monthly_usd=0.30)
+    call(Script("ok"), caps=caps, project="proj-a", estimate_usd=0.15)
+    call(Script("ok"), caps=caps, project="proj-b", estimate_usd=0.15)
+    with pytest.raises(MonthlyCapReached):
+        call(Script("ok"), caps=caps, project="proj-c", estimate_usd=0.01)
+
+
+def test_project_cap_stops_one_project_and_leaves_the_others(call):
+    caps = Caps(monthly_usd=100.0, project_usd=0.20)
+    call(Script("ok"), caps=caps, project="blog-images")
+    call(Script("ok"), caps=caps, project="blog-images")
+    with pytest.raises(ProjectCapReached) as stop:
+        call(Script("ok"), caps=caps, project="blog-images")
+    assert stop.value.brake == "project_cap" and "SPEND_PROJECT_CAP_USD_BLOG_IMAGES" in str(stop.value)
+    assert "Ask the owner to raise it" in str(stop.value)
+    call(Script("ok"), caps=Caps(monthly_usd=100.0), project="other")  # another project is not blocked
+
+
+# ---- one project, many spellings -------------------------------------------------------------------------------
+
+SPELLINGS = ["blog-images", "blog images", "Blog_Images", "BLOG-IMAGES"]  # all give the setting SPEND_PROJECT_CAP_USD_BLOG_IMAGES
+
+
+def test_the_project_cap_is_one_cap_for_every_spelling_of_the_project_name(call, ledger):
+    caps = Caps(monthly_usd=100.0, project_usd=0.40)
+    for spelling in SPELLINGS:  # four calls of $0.10, one for each spelling: exactly the cap
+        call(Script("ok"), caps=caps, project=spelling)
+    for spelling in SPELLINGS:  # now every spelling is stopped, not only the last one
+        with pytest.raises(ProjectCapReached) as stop:
+            call(Script("ok"), caps=caps, project=spelling)
+        assert "SPEND_PROJECT_CAP_USD_BLOG_IMAGES" in str(stop.value)
+    assert {ledger.project_total(spelling) for spelling in SPELLINGS} == {0.40}
+    # the rows keep the text exactly as it was given
+    assert [row["project"] for row in ledger.rows() if row["event"] == "reserve"] == SPELLINGS
+    call(Script("ok"), caps=caps, project="blog-images-2")  # another name is another project
+    call(Script("ok"), caps=caps, project="blog")
+
+
+def test_the_job_limit_counts_every_spelling_of_the_project_name_together(call):
+    caps, fn = Caps(monthly_usd=100.0, max_calls_per_job=4), Script("ok")
+    for spelling in SPELLINGS:
+        call(fn, caps=caps, project=spelling, job="run-1")
+    for spelling in SPELLINGS:
+        with pytest.raises(JobLimitReached):
+            call(fn, caps=caps, project=spelling, job="run-1")
+    call(fn, caps=caps, project="blog-images", job="run-2")  # another job is not affected
+    call(fn, caps=caps, project="other-project", job="run-1")  # another project is not affected
+    assert fn.calls == 6
+
+
+def test_finnish_and_non_latin_project_names_are_counted_without_errors(call, ledger):
+    caps = Caps(monthly_usd=100.0, project_usd=0.20)
+    for spelling in ["Kuvat äänet", "kuvat-äänet", "KUVAT_ÄÄNET"]:  # letters outside A-Z count: one key for all three
+        assert ledger.project_total(spelling) == 0
+    call(Script("ok"), caps=caps, project="Kuvat äänet")
+    assert ledger.project_total("kuvat-äänet") == 0.10
+    call(Script("ok"), caps=caps, project="ブログ")  # a name in another script is a normal name
+    assert ledger.project_total("ブログ") == 0.10 and ledger.project_total("ニュース") == 0
+    assert ledger.project_total("---") == 0 and ledger.project_total("") == 0
+
+
+# ---- the job limit ---------------------------------------------------------------------------------------------
+
+def test_job_limit_stops_a_loop_and_another_job_is_unaffected(call):
+    caps, fn = Caps(monthly_usd=100.0, max_calls_per_job=3), Script("ok")
+    for _ in range(3):
+        call(fn, caps=caps, job="loop")
+    with pytest.raises(JobLimitReached) as stop:
+        call(fn, caps=caps, job="loop")
+    assert fn.calls == 3 and stop.value.brake == "job_limit" and "SPEND_MAX_CALLS_PER_JOB" in str(stop.value)
+    assert "owner" in str(stop.value)
+    call(fn, caps=caps, job="another")
+
+
+def test_refused_calls_count_toward_the_job_limit(call):
+    caps = Caps(monthly_usd=100.0, max_calls_per_job=3)
+    fn = Script(FakeHttpError(429))
+    for _ in range(3):
+        with pytest.raises(NotRetried):
+            call(fn, caps=caps)
+    with pytest.raises(JobLimitReached):
+        call(fn, caps=caps)
+    assert fn.calls == 3
+
+
+def test_hard_ceiling_also_covers_retries(call):
+    fn = Script("ok")
+    with pytest.raises(HardCeilingExceeded) as stop:
+        call(fn, max_retries=4)
+    assert stop.value.brake == "hard_ceiling" and fn.calls == 0
+    with pytest.raises(ConfigError):
+        call(fn, max_retries=-1)
+
+
+# ---- retries: never on 401 402 403 429 -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429])
+def test_refusals_are_not_retried(call, ledger, sleeps, status):
+    fn = Script(HttpStatusError(status))
+    with pytest.raises(NotRetried) as stop:
+        call(fn, max_retries=3)
+    assert fn.calls == 1 and sleeps == []
+    assert stop.value.brake == "no_retry" and stop.value.status == status
+    assert isinstance(stop.value.__cause__, HttpStatusError)  # the original error is kept
+    assert str(status) in str(stop.value) and "owner" in str(stop.value)
+    assert ledger.month_total() == 0  # refused before any work: nothing billed
+    assert [r["outcome"] for r in ledger.rows() if r["event"] == "settle"] == ["rejected"]
+
+
+def test_a_refusal_found_on_the_error_response_is_not_retried(call):
+    fn = Script(FakeHttpError(402))
+    with pytest.raises(NotRetried):
+        call(fn, max_retries=3)
+    assert fn.calls == 1
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429, 503])
+def test_a_returned_response_with_a_refusal_status_is_treated_like_a_raised_error(call, status):
+    class Response:  # many clients return the response and do not raise
+        status_code = status
+
+    fn = Script(Response())
+    with pytest.raises((NotRetried, RetriesExhausted)):
+        call(fn, max_retries=2)
+    assert fn.calls == (1 if status != 503 else 3)
+
+
+def test_a_returned_ordinary_response_passes_through(call):
+    class Response:
+        status_code = 200
+
+    response = Response()
+    assert call(Script(response)) is response
+
+
+# ---- retries: a few, only on 5xx and timeouts ------------------------------------------------------------------
+
+@pytest.mark.parametrize("failure", [
+    HttpStatusError(500), HttpStatusError(503), FakeHttpError(504),
+    TimeoutError("slow"), socket.timeout("slow"), ConnectionResetError("dropped"),
+    urllib.error.URLError("no route"),
+])
+def test_server_errors_and_timeouts_are_retried_a_bounded_number_of_times(call, ledger, sleeps, failure):
+    fn = Script(failure)
+    with pytest.raises(RetriesExhausted) as stop:
+        call(fn, max_retries=2)
+    assert fn.calls == 3 and stop.value.attempts == 3 and stop.value.brake == "retries_exhausted"
+    assert len(sleeps) == 2
+    assert ledger.month_total() == 0.30  # a failed attempt may still be billed, so each stays on record
+    assert "max_retries" in str(stop.value)
+
+
+def test_the_retries_message_says_max_retries_is_an_argument_not_a_setting(call):
+    with pytest.raises(RetriesExhausted) as stop:
+        call(Script(HttpStatusError(503)), max_retries=1)
+    message = str(stop.value)
+    assert "setting: max_retries" not in message  # max_retries is not an environment setting
+    assert "the max_retries argument of guarded_call" in message
+    assert "not an environment setting" in message
+    assert f"the ceiling is {HARD_MAX_RETRIES}" in message
+
+
+def test_one_retry_is_the_default(call):
+    fn = Script(HttpStatusError(502))
+    with pytest.raises(RetriesExhausted):
+        call(fn)
+    assert fn.calls == 2
+
+
+def test_no_retry_at_all_when_max_retries_is_zero(call):
+    fn = Script(HttpStatusError(502))
+    with pytest.raises(RetriesExhausted):
+        call(fn, max_retries=0)
+    assert fn.calls == 1
+
+
+def test_a_retry_that_works_returns_the_result(call):
+    fn = Script(HttpStatusError(503), "second time")
+    assert call(fn, max_retries=2) == "second time"
+    assert fn.calls == 2
+
+
+def test_every_retry_checks_the_brakes_again(call):
+    fn = Script(HttpStatusError(503))
+    with pytest.raises(MonthlyCapReached):  # money for one attempt only: the retry is stopped by the cap
+        call(fn, caps=Caps(monthly_usd=0.15), max_retries=3)
+    assert fn.calls == 1
+
+
+def test_the_job_limit_also_stops_retries(call):
+    fn = Script(HttpStatusError(503))
+    with pytest.raises(JobLimitReached):
+        call(fn, caps=Caps(monthly_usd=100.0, max_calls_per_job=2), max_retries=3)
+    assert fn.calls == 2
+
+
+# ---- other errors ----------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+def test_other_client_errors_are_not_repeated_and_are_raised_as_they_are(call, status):
+    fn = Script(HttpStatusError(status))
+    with pytest.raises(HttpStatusError):
+        call(fn, max_retries=3)
+    assert fn.calls == 1
+
+
+def test_an_unknown_error_is_raised_unchanged_and_its_estimate_stays(call, ledger):
+    with pytest.raises(ValueError):
+        call(Script(ValueError("bug")))
+    assert ledger.month_total() == 0.10
+
+
+def test_ctrl_c_is_not_hidden(call, ledger):
+    with pytest.raises(KeyboardInterrupt):
+        call(Script(KeyboardInterrupt()))
+    assert ledger.month_total() == 0.10  # the estimate was on record before the call
+
+
+# ---- the job name: required, and new for every run -------------------------------------------------------------
+
+def test_a_job_name_is_required_there_is_no_default():
+    fn = Script("ok")
+    with pytest.raises(TypeError, match="job"):
+        guarded_call(fn, estimate_usd=0.1, project="p", provider="x", caps=Caps(), env={})  # type: ignore[call-arg]
+    assert fn.calls == 0
+
+
+@pytest.mark.parametrize("bad", ["", None, "x" * 201])
+def test_an_empty_or_huge_job_name_is_refused(call, bad):
+    fn = Script("ok")
+    with pytest.raises(ConfigError):
+        call(fn, job=bad)
+    assert fn.calls == 0
+
+
+def test_a_new_run_gets_a_fresh_job_count_and_a_reused_name_keeps_the_old_count(call):
+    caps, fn = Caps(monthly_usd=100.0, max_calls_per_job=2), Script("ok")
+    for _ in range(2):
+        call(fn, caps=caps, job="batch-" + run_id())  # every run has its own name, so no run is ever blocked by an old one
+    first = "batch-" + run_id()
+    call(fn, caps=caps, job=first)
+    call(fn, caps=caps, job=first)
+    with pytest.raises(JobLimitReached):
+        call(fn, caps=caps, job=first)  # the same name again: its old calls still count
+
+
+def test_run_ids_are_different_every_time_and_safe_inside_a_job_name():
+    ids = {run_id() for _ in range(50)}
+    assert len(ids) == 50
+    assert all(re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{6}", i) for i in ids)
+
+
+# ---- stop messages name the setting and do not teach how to turn off the stop --------------------------------------
+
+def test_money_cap_messages_say_ask_the_owner_and_give_no_how_to(call):
+    with pytest.raises(MonthlyCapReached) as monthly:
+        call(Script("ok"), caps=Caps(monthly_usd=0.05))
+    with pytest.raises(ProjectCapReached) as project:
+        call(Script("ok"), caps=Caps(monthly_usd=100.0, project_usd=0.05), project="blog-images")
+    for stop, name in ((monthly.value, "SPEND_MONTHLY_CAP_USD"), (project.value, "SPEND_PROJECT_CAP_USD_BLOG_IMAGES")):
+        text = str(stop)
+        assert "Ask the owner to raise it" in text and f"setting: {name}" in text
+        assert "Caps(" not in text and "set SPEND_" not in text and "export" not in text and "=" not in text
+        assert "would exceed" in text and "would pass" not in text  # plain words
+
+
+@pytest.mark.parametrize("env", [{"SPEND_PANIC": "1"}, {"SPEND_IMAGE_API_ENABLED": "0"}, {"SPEND_PANIC": "maybe"}])
+def test_kill_switch_messages_do_not_teach_how_to_turn_off_the_stop(call, env):
+    with pytest.raises(BrakeError) as stop:
+        call(Script("ok"), env=env)
+    text = str(stop.value)
+    assert "owner" in text and "unset" not in text and "delete" not in text and "export" not in text
